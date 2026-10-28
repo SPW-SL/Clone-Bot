@@ -8,33 +8,46 @@ SERVICE_FILE="/etc/systemd/system/clonebot.service"
 CLI_BIN="/usr/local/bin/clone-bot"
 
 clear
-echo "=========================================================="
-echo "          🤖 BOTS BY SPW - PARALLEL CLONER BOT            "
-echo "=========================================================="
-echo "          Mass Channel & Group Temp-Cache Cloner          "
-echo "=========================================================="
+cat << "BANNER_EOF"
+======================================================================
+  ____   ___ _____ ____    ____  __   __  ____  ______        __
+ | __ ) / _ \_   _/ ___|  | __ ) \ \ / / / ___||  _ \ \      / /
+ |  _ \| | | || | \___ \  |  _ \  \ V /  \___ \| |_) \ \ /\ / / 
+ | |_) | |_| || |  ___) | | |_) |  | |    ___) |  __/ \ V  V /  
+ |____/ \___/ |_| |____/  |____/   |_|   |____/|_|     \_/\_/   
+                                                                
+   ⚡ PARALLEL TEMP-CACHE, ALBUM & RANGE CHANNEL CLONER BOT ⚡
+======================================================================
+BANNER_EOF
 
 if [ "$EUID" -ne 0 ]; then
     echo "❌ Please run this installer as root (sudo bash install.sh)."
     exit 1
 fi
 
+echo ""
+echo "💡 RECOMMENDED SETTINGS & FEATURES:"
+echo " • Parallel Workers : 2x to 4x is recommended to avoid Telegram FloodWaits."
+echo " • Custom ID Range  : Clone specific message ranges (Start ID -> End ID)."
+echo " • Album Support    : Automatically keeps multi-photo/video albums grouped."
+echo " • Zero Disk Bloating: Cached files are wiped immediately after each upload."
+echo "======================================================================"
+
 mkdir -p "$INSTALL_DIR" "$CACHE_DIR"
 
-# 1. Interactive Configuration
 USE_EXISTING="n"
 if [ -f "$CONFIG_FILE" ]; then
-    read -rp "⚙️ Existing config.json found. Keep current credentials? [Y/n]: " USE_EXISTING
+    read -rp "⚙️  Existing config.json found. Keep current credentials? [Y/n]: " USE_EXISTING
     USE_EXISTING=${USE_EXISTING:-Y}
 fi
 
 if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
     echo ""
-    echo "🔑 Please enter your Telegram API credentials (from my.telegram.org) & Bot Token (@BotFather):"
-    read -rp "👉 Enter APP API_ID (e.g. 11872337): " INPUT_API_ID
-    read -rp "👉 Enter API_HASH: " INPUT_API_HASH
-    read -rp "👉 Enter BOT_TOKEN: " INPUT_BOT_TOKEN
-    read -rp "👉 Enter ADMIN_IDS (space-separated, e.g. 1551433194 5190391120): " INPUT_ADMINS
+    echo "🔑 Enter your Telegram Credentials (from https://my.telegram.org & @BotFather):"
+    read -rp "👉 Enter APP API_ID (e.g. 12345678): " INPUT_API_ID
+    read -rp "👉 Enter API_HASH (e.g. a1b2c3d4e5f6...): " INPUT_API_HASH
+    read -rp "👉 Enter BOT_TOKEN (from @BotFather): " INPUT_BOT_TOKEN
+    read -rp "👉 Enter ADMIN_IDS (space-separated, e.g. 111111111 222222222): " INPUT_ADMINS
 
     ADMIN_JSON=$(echo "$INPUT_ADMINS" | tr ',' ' ' | awk '{
         printf "[";
@@ -59,16 +72,17 @@ CONFIG_EOF
     echo "✅ Configuration saved to $CONFIG_FILE"
 fi
 
-echo "=========================================================="
-echo " 📦 Installing System Dependencies (ffmpeg, python)..."
-echo "=========================================================="
+echo ""
+echo "======================================================================"
+echo " 📦 Installing System Dependencies (Python, FFmpeg, Build Tools)..."
+echo "======================================================================"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y python3 python3-venv python3-pip ffmpeg git curl build-essential
 
-echo "=========================================================="
-echo " 🐍 Setting Up Python Virtual Environment & Packages..."
-echo "=========================================================="
+echo "======================================================================"
+echo " 🐍 Building Python Virtual Environment & Installing Libraries..."
+echo "======================================================================"
 cd "$INSTALL_DIR"
 if [ ! -f "$INSTALL_DIR/venv/bin/python3" ]; then
     python3 -m venv venv
@@ -76,9 +90,9 @@ fi
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --upgrade telethon cryptg qrcode pillow
 
-echo "=========================================================="
-echo " 🤖 Writing Cloner Application Application Code..."
-echo "=========================================================="
+echo "======================================================================"
+echo " 🤖 Deploying Cloner Bot Application ($INSTALL_DIR/cloner.py)..."
+echo "======================================================================"
 cat << 'PY_EOF' > "$INSTALL_DIR/cloner.py"
 import os
 import io
@@ -178,6 +192,7 @@ ACTIVE_CLONE = {
 }
 PENDING_SETUP = {}
 LOGIN_STATE = {}
+RANGE_WAIT_STATE = {}
 WORKER_STATUS = {}
 
 def is_admin(uid: int) -> bool:
@@ -274,6 +289,33 @@ def parse_tg_target(raw: str):
 
     return text, None
 
+def parse_input_with_range(raw_text: str):
+    tokens = raw_text.strip().split()
+    links = [t for t in tokens if "t.me/" in t or re.match(r"^-100\d+$", t)]
+    if not links:
+        target, mid = parse_tg_target(tokens[0])
+        return target, 1, (mid or 0)
+
+    if len(links) >= 2:
+        t1, id1 = parse_tg_target(links[0])
+        _, id2 = parse_tg_target(links[1])
+        if id1 and id2:
+            return t1, min(id1, id2), max(id1, id2)
+
+    target, link_msg_id = parse_tg_target(links[0])
+    remainder = raw_text.replace(links[0], " ")
+    nums = [int(x) for x in re.findall(r"\b\d+\b", remainder)]
+
+    if len(nums) >= 2:
+        s_id, e_id = min(nums[0], nums[1]), max(nums[0], nums[1])
+        return target, max(1, s_id), e_id
+    elif len(nums) == 1:
+        if link_msg_id and nums[0] < link_msg_id:
+            return target, max(1, nums[0]), link_msg_id
+        return target, max(1, nums[0]), 0
+
+    return target, 1, (link_msg_id or 0)
+
 async def is_user_logged_in() -> bool:
     try:
         if not user_client.is_connected():
@@ -301,8 +343,9 @@ def build_setup_buttons(key: str, selected_workers: int):
     return [
         w_row[:3],
         w_row[3:],
-        [Button.inline(f"💾 Cache & Upload Media Only ({selected_workers}x Parallel)", f"go:{key}:media:cache".encode())],
-        [Button.inline(f"💾 Cache & Upload All Media+Text ({selected_workers}x Parallel)", f"go:{key}:all:cache".encode())],
+        [Button.inline("🔢 Set Custom ID Range (Start - End)", f"setr:{key}".encode())],
+        [Button.inline(f"💾 Cache & Upload Media + Albums ({selected_workers}x Parallel)", f"go:{key}:media:cache".encode())],
+        [Button.inline(f"💾 Cache & Upload All + Text ({selected_workers}x Parallel)", f"go:{key}:all:cache".encode())],
         [
             Button.inline("📨 Direct Forward (Keep Tag)", f"go:{key}:media:fwd".encode()),
             Button.inline("📋 Direct Copy (No Tag)", f"go:{key}:media:copy".encode())
@@ -311,16 +354,18 @@ def build_setup_buttons(key: str, selected_workers: int):
     ]
 
 def build_setup_text(setup: dict) -> str:
+    s_id = setup.get("start_id", 1)
     end_id = setup.get("end_id", 0)
-    range_txt = f"`{setup.get('start_id', 1)}` → `{end_id}`" if end_id > 0 else "`All History (Auto-Detect)`"
+    range_txt = f"`{s_id}` → `{end_id}` (`{max(1, end_id - s_id + 1)}` msgs)" if end_id > 0 else f"`{s_id}` → `Latest (Auto-Detect)`"
     w = setup.get("workers", 2)
     return (
         f"🎯 **Source Group/Channel Ready!**\n\n"
         f"📤 **Source:** `{setup['source']}`\n"
         f"📥 **Destination:** `{setup['dest']}`\n"
         f"🔢 **Message Range:** {range_txt}\n"
-        f"⚡ **Parallel Files (Download/Upload):** `{w}x Concurrent`\n\n"
-        "👇 **First choose your Parallel Speed (`1x`–`8x`), then tap a Transfer Mode:**"
+        f"🖼️ **Album Mode:** `Enabled (Preserves Media Groups)`\n"
+        f"⚡ **Parallel Workers:** `{w}x Concurrent`\n\n"
+        "💡 *Tap **🔢 Set Custom ID Range** to pick specific Start/End message IDs, or choose a Transfer Mode below:*"
     )
 
 def get_video_meta(path: str):
@@ -346,75 +391,205 @@ def make_thumb(vpath: str, tpath: str):
     except Exception:
         return None
 
-async def cache_and_upload_message(dl_client, up_client, dest_entity, msg) -> bool:
-    job_cache_dir = CACHE_DIR / f"msg_{msg.id}"
-    job_cache_dir.mkdir(parents=True, exist_ok=True)
-    cached_file = None
-    thumb_file = None
+def group_messages_into_units(msgs: list) -> list[list]:
+    units = []
+    current_unit = []
+    current_gid = None
+
+    for m in msgs:
+        gid = getattr(m, "grouped_id", None)
+        if gid is not None:
+            if current_gid == gid and len(current_unit) < 10:
+                current_unit.append(m)
+            else:
+                if current_unit:
+                    units.append(current_unit)
+                current_unit = [m]
+                current_gid = gid
+        else:
+            if current_unit:
+                units.append(current_unit)
+                current_unit = []
+                current_gid = None
+            units.append([m])
+
+    if current_unit:
+        units.append(current_unit)
+    return units
+
+async def cache_and_upload_unit(dl_client, up_client, dest_entity, unit: list) -> int:
+    first_id = unit[0].id
+    is_album = len(unit) > 1
+    unit_cache_dir = CACHE_DIR / f"unit_{first_id}"
+    unit_cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
             await asyncio.sleep(1)
         if ACTIVE_CLONE["cancelled"]:
-            return False
+            return 0
 
+        if is_album:
+            cached_files = []
+            captions = []
+            total_items = len(unit)
+
+            for idx, m in enumerate(unit, 1):
+                while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
+                    await asyncio.sleep(1)
+                if ACTIVE_CLONE["cancelled"]:
+                    return 0
+
+                if not isinstance(m.media, (MessageMediaPhoto, MessageMediaDocument)):
+                    continue
+
+                item_prefix = unit_cache_dir / f"{idx:02d}_msg_{m.id}"
+                t0 = time.time()
+                WORKER_STATUS[first_id] = {
+                    "stage": f"📥 Caching Album ({idx}/{total_items})",
+                    "curr": 0,
+                    "tot": 0,
+                    "speed": 0.0
+                }
+
+                def dl_prog(curr, tot, i=idx):
+                    if ACTIVE_CLONE["cancelled"]:
+                        raise asyncio.CancelledError()
+                    spd = curr / max(0.1, time.time() - t0)
+                    WORKER_STATUS[first_id] = {
+                        "stage": f"📥 Album ({i}/{total_items})",
+                        "curr": curr,
+                        "tot": tot,
+                        "speed": spd
+                    }
+
+                while True:
+                    try:
+                        fpath = await dl_client.download_media(
+                            m,
+                            file=str(item_prefix),
+                            progress_callback=dl_prog
+                        )
+                        break
+                    except FloodWaitError as fw:
+                        WORKER_STATUS[first_id] = {
+                            "stage": f"⏳ FloodWait ({fw.seconds}s)",
+                            "curr": 0,
+                            "tot": 0,
+                            "speed": 0.0
+                        }
+                        await asyncio.sleep(fw.seconds + 2)
+
+                if fpath and os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+                    cached_files.append(fpath)
+                    captions.append(m.text or "")
+
+            if not cached_files:
+                return 0
+
+            while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
+                await asyncio.sleep(1)
+            if ACTIVE_CLONE["cancelled"]:
+                return 0
+
+            total_album_bytes = sum(os.path.getsize(f) for f in cached_files)
+            up_t0 = time.time()
+            WORKER_STATUS[first_id] = {
+                "stage": f"📤 Uploading Album ({len(cached_files)} items)",
+                "curr": 0,
+                "tot": total_album_bytes,
+                "speed": 0.0
+            }
+
+            def up_prog(curr, tot):
+                if ACTIVE_CLONE["cancelled"]:
+                    raise asyncio.CancelledError()
+                spd = curr / max(0.1, time.time() - up_t0)
+                WORKER_STATUS[first_id] = {
+                    "stage": f"📤 Album ({len(cached_files)} items)",
+                    "curr": curr,
+                    "tot": tot,
+                    "speed": spd
+                }
+
+            while True:
+                try:
+                    await up_client.send_file(
+                        dest_entity,
+                        file=cached_files,
+                        caption=captions,
+                        supports_streaming=True,
+                        progress_callback=up_prog
+                    )
+                    break
+                except FloodWaitError as fw:
+                    WORKER_STATUS[first_id] = {
+                        "stage": f"⏳ FloodWait ({fw.seconds}s)",
+                        "curr": 0,
+                        "tot": total_album_bytes,
+                        "speed": 0.0
+                    }
+                    await asyncio.sleep(fw.seconds + 2)
+
+            return len(cached_files)
+
+        msg = unit[0]
         if msg.media:
             if not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
                 if msg.text:
                     await up_client.send_message(dest_entity, msg.text, formatting_entities=msg.entities)
-                    return True
-                return False
+                    return 1
+                return 0
 
             t0 = time.time()
-            WORKER_STATUS[msg.id] = {"stage": "📥 Caching", "curr": 0, "tot": 0, "speed": 0.0}
+            WORKER_STATUS[first_id] = {"stage": "📥 Caching", "curr": 0, "tot": 0, "speed": 0.0}
 
             def dl_prog(curr, tot):
                 if ACTIVE_CLONE["cancelled"]:
                     raise asyncio.CancelledError()
-                now = time.time()
-                spd = curr / max(0.1, now - t0)
-                WORKER_STATUS[msg.id] = {"stage": "📥 Caching", "curr": curr, "tot": tot, "speed": spd}
+                spd = curr / max(0.1, time.time() - t0)
+                WORKER_STATUS[first_id] = {"stage": "📥 Caching", "curr": curr, "tot": tot, "speed": spd}
 
             while True:
                 try:
                     cached_file = await dl_client.download_media(
                         msg,
-                        file=str(job_cache_dir) + "/",
+                        file=str(unit_cache_dir) + "/",
                         progress_callback=dl_prog
                     )
                     break
                 except FloodWaitError as fw:
-                    WORKER_STATUS[msg.id] = {"stage": f"⏳ FloodWait ({fw.seconds}s)", "curr": 0, "tot": 0, "speed": 0.0}
+                    WORKER_STATUS[first_id] = {"stage": f"⏳ FloodWait ({fw.seconds}s)", "curr": 0, "tot": 0, "speed": 0.0}
                     await asyncio.sleep(fw.seconds + 2)
 
             if not cached_file or not os.path.exists(cached_file):
-                return False
+                return 0
 
             ext = os.path.splitext(cached_file)[1].lower()
             attrs = []
+            thumb_file = None
             is_video = ext in VIDEO_EXTS
             if is_video:
                 d, w, h = await asyncio.to_thread(get_video_meta, cached_file)
                 attrs.append(DocumentAttributeVideo(duration=d, w=w, h=h, supports_streaming=True))
                 thumb_file = await asyncio.to_thread(
-                    make_thumb, cached_file, str(job_cache_dir / "thumb.jpg")
+                    make_thumb, cached_file, str(unit_cache_dir / "thumb.jpg")
                 )
 
             while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
                 await asyncio.sleep(1)
             if ACTIVE_CLONE["cancelled"]:
-                return False
+                return 0
 
             up_t0 = time.time()
             fsize = os.path.getsize(cached_file)
-            WORKER_STATUS[msg.id] = {"stage": "📤 Uploading", "curr": 0, "tot": fsize, "speed": 0.0}
+            WORKER_STATUS[first_id] = {"stage": "📤 Uploading", "curr": 0, "tot": fsize, "speed": 0.0}
 
             def up_prog(curr, tot):
                 if ACTIVE_CLONE["cancelled"]:
                     raise asyncio.CancelledError()
-                now = time.time()
-                spd = curr / max(0.1, now - up_t0)
-                WORKER_STATUS[msg.id] = {"stage": "📤 Uploading", "curr": curr, "tot": tot, "speed": spd}
+                spd = curr / max(0.1, time.time() - up_t0)
+                WORKER_STATUS[first_id] = {"stage": "📤 Uploading", "curr": curr, "tot": tot, "speed": spd}
 
             while True:
                 try:
@@ -430,10 +605,10 @@ async def cache_and_upload_message(dl_client, up_client, dest_entity, msg) -> bo
                     )
                     break
                 except FloodWaitError as fw:
-                    WORKER_STATUS[msg.id] = {"stage": f"⏳ FloodWait ({fw.seconds}s)", "curr": 0, "tot": fsize, "speed": 0.0}
+                    WORKER_STATUS[first_id] = {"stage": f"⏳ FloodWait ({fw.seconds}s)", "curr": 0, "tot": fsize, "speed": 0.0}
                     await asyncio.sleep(fw.seconds + 2)
 
-            return True
+            return 1
 
         elif msg.text:
             while True:
@@ -446,12 +621,12 @@ async def cache_and_upload_message(dl_client, up_client, dest_entity, msg) -> bo
                     break
                 except FloodWaitError as fw:
                     await asyncio.sleep(fw.seconds + 2)
-            return True
+            return 1
 
-        return False
+        return 0
     finally:
-        WORKER_STATUS.pop(msg.id, None)
-        shutil.rmtree(job_cache_dir, ignore_errors=True)
+        WORKER_STATUS.pop(first_id, None)
+        shutil.rmtree(unit_cache_dir, ignore_errors=True)
 
 async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
     ACTIVE_CLONE["running"] = True
@@ -461,7 +636,7 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
 
     src_target = job_cfg["source"]
     dest_target = job_cfg["dest"]
-    start_id = int(job_cfg.get("start_id", 1))
+    start_id = max(1, int(job_cfg.get("start_id", 1)))
     end_id = int(job_cfg.get("end_id") or 0)
     media_only = bool(job_cfg.get("media_only", True))
     mode = job_cfg.get("mode", "cache")
@@ -473,6 +648,7 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
     dl_client = user_client if use_user else bot
 
     forwarded_total = int(job_cfg.get("forwarded_total", 0))
+    albums_total = int(job_cfg.get("albums_total", 0))
     skipped_total = int(job_cfg.get("skipped_total", 0))
     t_start = time.time()
     current_scan_id = start_id
@@ -500,14 +676,14 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
                     f"• `ID {mid}` {st['stage']}: `[{progress_bar(c_bytes, t_bytes, 8)}] {w_pct:.0f}%` (`{fmt_size(spd)}/s`)"
                 )
 
-            active_block = "\n".join(worker_lines) if worker_lines else "• *Waiting for next batch...*"
-            state_banner = "⏸️ **PAUSED**" if ACTIVE_CLONE["paused"] else f"🔄 **Cloning in Progress ({workers}x Parallel)...**"
+            active_block = "\n".join(worker_lines) if worker_lines else "• *Scanning next batch...*"
+            state_banner = "⏸️ **PAUSED**" if ACTIVE_CLONE["paused"] else f"🔄 **Cloning Media & Albums ({workers}x Parallel)...**"
 
             text = (
                 f"{state_banner}\n"
                 f"`[{progress_bar(done_ids, total_range, 12)}] {pct:.1f}%`\n\n"
-                f"✅ **Uploaded:** `{forwarded_total}` | ⏭️ **Skipped:** `{skipped_total}`\n"
-                f"🔢 **Progress ID:** `{current_scan_id} / {end_id}`\n"
+                f"✅ **Uploaded Files:** `{forwarded_total}` (🖼️ **Albums:** `{albums_total}`)\n"
+                f"⏭️ **Skipped:** `{skipped_total}` | 🔢 **Range:** `{start_id}` → `{end_id}` (At `{current_scan_id}`)\n"
                 f"🧹 **Active Temp Cache:** `{fmt_size(get_dir_size(CACHE_DIR))}`\n"
                 f"⏱️ **Elapsed:** `{fmt_time(elapsed)}` • **ETA:** `{fmt_time(eta)}`\n\n"
                 f"⚡ **Active Parallel Workers ({len(WORKER_STATUS)}/{workers}):**\n"
@@ -536,65 +712,82 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
             else:
                 end_id = 6000
 
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+
         total_range = max(1, end_id - start_id + 1)
         ui_task = asyncio.create_task(ui_updater_loop(total_range))
 
         sem = asyncio.Semaphore(workers)
-        fetch_chunk_size = max(30, workers * 10)
+        fetch_chunk_size = max(40, workers * 12)
 
-        async def process_one_message(m):
-            nonlocal forwarded_total, skipped_total
+        async def process_one_unit(unit: list):
+            nonlocal forwarded_total, albums_total, skipped_total
+            unit_ids = [m.id for m in unit]
+            is_album = len(unit) > 1
+
             async with sem:
                 if ACTIVE_CLONE["cancelled"]:
-                    in_flight_ids.discard(m.id)
+                    for uid_item in unit_ids:
+                        in_flight_ids.discard(uid_item)
                     return
                 while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
                     await asyncio.sleep(1)
                 if ACTIVE_CLONE["cancelled"]:
-                    in_flight_ids.discard(m.id)
+                    for uid_item in unit_ids:
+                        in_flight_ids.discard(uid_item)
                     return
 
                 try:
                     if mode == "cache":
-                        ok = await cache_and_upload_message(dl_client, up_client, dest_entity, m)
-                        if ok:
-                            forwarded_total += 1
+                        sent_cnt = await cache_and_upload_unit(dl_client, up_client, dest_entity, unit)
+                        if sent_cnt > 0:
+                            forwarded_total += sent_cnt
+                            if is_album:
+                                albums_total += 1
                         else:
-                            skipped_total += 1
+                            skipped_total += len(unit)
                     else:
                         try:
                             await dl_client.forward_messages(
                                 entity=dest_entity,
-                                messages=m.id,
+                                messages=unit_ids,
                                 from_peer=src_entity,
                                 drop_author=drop_author
                             )
-                            forwarded_total += 1
+                            forwarded_total += len(unit_ids)
+                            if is_album:
+                                albums_total += 1
                         except ChatForwardsRestrictedError:
-                            ok = await cache_and_upload_message(dl_client, up_client, dest_entity, m)
-                            if ok:
-                                forwarded_total += 1
+                            sent_cnt = await cache_and_upload_unit(dl_client, up_client, dest_entity, unit)
+                            if sent_cnt > 0:
+                                forwarded_total += sent_cnt
+                                if is_album:
+                                    albums_total += 1
                             else:
-                                skipped_total += 1
+                                skipped_total += len(unit)
                         except FloodWaitError as fw:
                             await asyncio.sleep(fw.seconds + 2)
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
-                    logging.warning(f"Message {m.id} failed: {e}")
-                    skipped_total += 1
+                    logging.warning(f"Unit {unit_ids} failed: {e}")
+                    skipped_total += len(unit)
                 finally:
-                    in_flight_ids.discard(m.id)
-                    safe_next_id = min(in_flight_ids) if in_flight_ids else (m.id + 1)
+                    for uid_item in unit_ids:
+                        in_flight_ids.discard(uid_item)
+                    safe_next_id = min(in_flight_ids) if in_flight_ids else (max(unit_ids) + 1)
                     job_cfg["start_id"] = safe_next_id
                     job_cfg["end_id"] = end_id
                     job_cfg["forwarded_total"] = forwarded_total
+                    job_cfg["albums_total"] = albums_total
                     job_cfg["skipped_total"] = skipped_total
                     job_cfg["workers"] = workers
                     save_resume(job_cfg)
                     await asyncio.sleep(delay_sec)
 
-        for batch_start in range(start_id, end_id + 1, fetch_chunk_size):
+        batch_start = start_id
+        while batch_start <= end_id:
             if ACTIVE_CLONE["cancelled"]:
                 break
             while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
@@ -622,17 +815,40 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
                     skipped_total += 1
                     continue
                 valid_msgs.append(m)
-                in_flight_ids.add(m.id)
 
-            if valid_msgs:
-                tasks = [asyncio.create_task(process_one_message(m)) for m in valid_msgs]
+            if valid_msgs and getattr(valid_msgs[-1], "grouped_id", None) is not None and batch_end < end_id:
+                last_gid = valid_msgs[-1].grouped_id
+                peek_ids = list(range(batch_end + 1, min(end_id, batch_end + 10) + 1))
+                if peek_ids:
+                    while True:
+                        try:
+                            peek_msgs = await dl_client.get_messages(src_entity, ids=peek_ids)
+                            break
+                        except FloodWaitError as fw:
+                            await asyncio.sleep(fw.seconds + 2)
+                    for pm in (peek_msgs or []):
+                        if pm is not None and getattr(pm, "grouped_id", None) == last_gid:
+                            valid_msgs.append(pm)
+                            batch_end = max(batch_end, pm.id)
+                        else:
+                            break
+
+            units = group_messages_into_units(valid_msgs)
+            for u in units:
+                for m in u:
+                    in_flight_ids.add(m.id)
+
+            if units:
+                tasks = [asyncio.create_task(process_one_unit(u)) for u in units]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
             current_scan_id = batch_end + 1
+            batch_start = batch_end + 1
             if not in_flight_ids:
                 job_cfg["start_id"] = current_scan_id
                 job_cfg["end_id"] = end_id
                 job_cfg["forwarded_total"] = forwarded_total
+                job_cfg["albums_total"] = albums_total
                 job_cfg["skipped_total"] = skipped_total
                 job_cfg["workers"] = workers
                 save_resume(job_cfg)
@@ -646,7 +862,7 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
         if ACTIVE_CLONE["cancelled"]:
             await status_msg.edit(
                 f"🛑 **Stopped at Message ID `{job_cfg['start_id']}` & Cache Wiped (`0.00 B`).**\n"
-                f"✅ **Total Uploaded:** `{forwarded_total}`\n"
+                f"✅ **Total Uploaded:** `{forwarded_total}` (🖼️ **Albums:** `{albums_total}`)\n"
                 "💡 *Send `/resume` anytime to continue from this exact message!*",
                 buttons=None
             )
@@ -655,7 +871,9 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
                 RESUME_FILE.unlink(missing_ok=True)
             await status_msg.edit(
                 f"🎉 **Cloning 100% Complete ({workers}x Parallel)!**\n\n"
-                f"✅ **Total Uploaded:** `{forwarded_total}`\n"
+                f"🔢 **Cloned Range:** `{start_id}` → `{end_id}`\n"
+                f"✅ **Total Uploaded Files:** `{forwarded_total}`\n"
+                f"🖼️ **Combined Albums Uploaded:** `{albums_total}`\n"
                 f"⏭️ **Skipped:** `{skipped_total}`\n"
                 f"🧹 **VPS Cache Folder:** `0.00 B (Clean)`\n"
                 f"⏱️ **Total Time:** `{fmt_time(time.time() - t_start)}`",
@@ -678,25 +896,22 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
         ACTIVE_CLONE["cancelled"] = False
         ACTIVE_CLONE["task"] = None
 
-# ================= COMMAND HANDLERS & BOT INSTRUCTIONS =================
-
 HELP_INSTRUCTIONS = (
-    "📖 **BOTS BY SPW — Cloner Bot Instructions**\n\n"
-    "**1. How to Log In (User Account):**\n"
-    "• Send **`/qr`** to generate a scannable QR code. Open Telegram on your phone → **Settings → Devices → Link Desktop Device** and scan it (No OTP required!).\n"
-    "• Or send **`/login`** to sign in via phone number and OTP.\n\n"
-    "**2. How to Set Your Destination:**\n"
-    "• Add this bot as an **Admin** in your target Channel or Group.\n"
-    "• Send: `/setdest https://t.me/your_channel` (or run `/setdest` inside the destination channel/group).\n\n"
-    "**3. How to Clone Channels & Groups (Even Restricted Content):**\n"
-    "• Paste **any public or private source link** (or last message link `https://t.me/c/12345/5000`) into this chat.\n"
-    "• Pick your **Parallel Speed (`1x` to `8x`)**.\n"
-    "• Choose **💾 Cache & Upload** (automatically downloads each file, streams it into your channel, and deletes VPS cache instantly) or **📨 Direct Forward**.\n\n"
-    "**4. Useful Commands:**\n"
-    "• `/cleancache` (or `/clean`) — Force-wipes `/opt/clonebot/cache`\n"
-    "• `/clearresume` — Clears saved resume checkpoints\n"
-    "• `/workers <1-10>` — Sets default parallel speed\n"
-    "• `/logout` — Logs out the user session"
+    "📖 **BOTS BY SPW — Parallel, Album & Range Cloner Guide**\n\n"
+    "**1. Connect a User Account (Recommended):**\n"
+    "• Send **`/qr`** and scan the QR code from **Telegram → Settings → Devices → Link Desktop Device** (No OTP needed!).\n"
+    "• Or send **`/login`** to sign in with a phone number.\n\n"
+    "**2. Set Your Destination Channel or Group:**\n"
+    "• Make sure this Bot is an **Admin** in your destination Channel/Group.\n"
+    "• Send `/setdest https://t.me/your_channel` or `/setdest -100xxxxxxxxxx`.\n\n"
+    "**3. Select Custom Message Range & Clone:**\n"
+    "• **Method A (Interactive Button):** Paste any channel/group link and tap **🔢 Set Custom ID Range (Start - End)**.\n"
+    "• **Method B (Paste Two Links):** Paste both the start post link and end post link in one message (e.g. `https://t.me/c/123/100 https://t.me/c/123/500`).\n"
+    "• **Method C (Command):** `/clone <link> <start_id> <end_id>`\n\n"
+    "**4. Maintenance Commands:**\n"
+    "• `/cleancache` (or `/clean`) — Force-wipe `/opt/clonebot/cache`\n"
+    "• `/clearresume` — Delete saved resume checkpoint\n"
+    "• `/workers <1-10>` — Set default parallel speed (`2x`–`4x` recommended)"
 )
 
 @bot.on(events.NewMessage(pattern=r"^/start"))
@@ -723,19 +938,22 @@ async def start_h(event):
             Button.inline("⚡ 5x", b"defw:5"),
             Button.inline("⚡ 8x", b"defw:8")
         ],
-        [Button.inline("📖 Instructions", b"menu:help"), Button.inline("🧹 Clean Cache", b"menu:cleancache")],
-        [Button.inline("📱 QR Login (No OTP)", b"menu:qr"), Button.inline("🗑️ Logout User", b"menu:logout")]
+        [Button.inline("📖 How to Use", b"menu:help"), Button.inline("🧹 Clean Cache", b"menu:cleancache")],
+        [Button.inline("📱 QR Login (No OTP)", b"menu:qr"), Button.inline("🗑️ Clear Resume", b"menu:clearresume")],
+        [Button.inline("🚪 Logout User", b"menu:logout")]
     ]
     if res:
-        btns.insert(0, [Button.inline(f"▶️ Resume Saved Job (ID {res.get('start_id')})", b"menu:resume")])
+        btns.insert(0, [Button.inline(f"▶️ Resume Saved Job (ID {res.get('start_id')} → {res.get('end_id')})", b"menu:resume")])
 
     await event.reply(
-        "🤖 **BOTS BY SPW — Parallel Cloner Bot**\n\n"
+        "🤖 **BOTS BY SPW — Parallel Album & Range Cloner**\n\n"
         f"📥 **Destination:** `{dest}`\n"
         f"👤 **User Session:** `{u_stat}`\n"
-        f"⚡ **Parallel Speed:** `{workers}x Concurrent`\n"
-        f"🧹 **Cache Size:** `{fmt_size(cache_bytes)}`\n\n"
-        "👇 *Paste any channel/group link below to start cloning!*",
+        f"🖼️ **Album Grouping:** `Active ✅`\n"
+        f"🔢 **Custom ID Range:** `Supported ✅`\n"
+        f"⚡ **Parallel Workers:** `{workers}x Concurrent`\n"
+        f"🧹 **Temp Cache Size:** `{fmt_size(cache_bytes)}`\n\n"
+        "👇 *Paste a channel/group link (or two post links for a range) below to start!*",
         buttons=btns
     )
 
@@ -799,6 +1017,16 @@ async def setdest_h(event):
     save_config(cfg)
     await event.reply(f"✅ **Destination saved as:** `{target}`")
 
+@bot.on(events.NewMessage(pattern=r"^/delay\s+(\d+(?:\.\d+)?)"))
+async def delay_h(event):
+    if not is_admin(event.sender_id):
+        return
+    val = max(0.2, float(event.pattern_match.group(1)))
+    cfg = load_config()
+    cfg["delay_seconds"] = val
+    save_config(cfg)
+    await event.reply(f"⏱️ **Worker delay updated to:** `{val}s`")
+
 @bot.on(events.NewMessage(pattern=r"^/resume"))
 async def resume_h(event):
     if not is_admin(event.sender_id):
@@ -817,6 +1045,7 @@ async def qr_login_h(event):
         return
     uid = event.sender_id
     LOGIN_STATE.pop(uid, None)
+    RANGE_WAIT_STATE.pop(uid, None)
     await reset_user_session()
     status = await event.reply("⏳ **Generating Login QR Code...**")
 
@@ -848,15 +1077,17 @@ async def qr_login_h(event):
 async def login_h(event):
     if not is_admin(event.sender_id):
         return
+    RANGE_WAIT_STATE.pop(event.sender_id, None)
     await reset_user_session()
     LOGIN_STATE[event.sender_id] = {"step": "phone"}
-    await event.reply("🔑 Send your **Phone Number** (e.g. `+94771234567`):")
+    await event.reply("🔑 Send your **Phone Number** in international format (e.g. `+1234567890`):")
 
 @bot.on(events.NewMessage(pattern=r"^/logout"))
 async def logout_h(event):
     if not is_admin(event.sender_id):
         return
     LOGIN_STATE.pop(event.sender_id, None)
+    RANGE_WAIT_STATE.pop(event.sender_id, None)
     try:
         if await is_user_logged_in():
             await user_client.log_out()
@@ -864,6 +1095,45 @@ async def logout_h(event):
         pass
     await reset_user_session()
     await event.reply("🗑️ **User Session logged out.**")
+
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in RANGE_WAIT_STATE and e.raw_text and not e.raw_text.startswith("/")))
+async def range_input_flow_h(event):
+    uid = event.sender_id
+    st = RANGE_WAIT_STATE.pop(uid, None)
+    if not st:
+        return
+    key = st["key"]
+    setup_msg = st["setup_msg"]
+    setup = PENDING_SETUP.get(key)
+    if not setup:
+        return await event.reply("⚠️ **Session expired. Please paste the channel link again.**")
+
+    text = event.raw_text.strip()
+    link_ids = [int(x) for x in re.findall(r"t\.me/(?:c/\d+|[a-zA-Z0-9_]+)/(\d+)", text)]
+    if len(link_ids) >= 2:
+        s_id, e_id = min(link_ids[0], link_ids[1]), max(link_ids[0], link_ids[1])
+    else:
+        nums = [int(x) for x in re.findall(r"\b\d+\b", text)]
+        if not nums:
+            return await event.reply("⚠️ **Invalid range.** Send two numbers like `100 500` or `100-500`.")
+        if len(nums) >= 2:
+            s_id, e_id = min(nums[0], nums[1]), max(nums[0], nums[1])
+        else:
+            s_id = nums[0]
+            e_id = setup.get("end_id", 0)
+
+    setup["start_id"] = max(1, s_id)
+    setup["end_id"] = max(0, e_id)
+
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    await setup_msg.edit(
+        build_setup_text(setup),
+        buttons=build_setup_buttons(key, setup["workers"])
+    )
 
 @bot.on(events.NewMessage(func=lambda e: e.sender_id in LOGIN_STATE and e.raw_text and not e.raw_text.startswith("/")))
 async def login_flow_h(event):
@@ -902,8 +1172,17 @@ async def login_flow_h(event):
         LOGIN_STATE.pop(uid, None)
         await event.reply(f"❌ **Login Error:** `{e}`")
 
-@bot.on(events.NewMessage(func=lambda e: is_admin(e.sender_id) and e.sender_id not in LOGIN_STATE and e.raw_text and ("t.me/" in e.raw_text or re.match(r"^-100\d+$", e.raw_text.strip())) and not e.raw_text.startswith("/")))
+@bot.on(events.NewMessage(pattern=r"^/clone\s+(.+)"))
+async def clone_cmd_h(event):
+    if not is_admin(event.sender_id):
+        return
+    await open_clone_setup(event, event.pattern_match.group(1))
+
+@bot.on(events.NewMessage(func=lambda e: is_admin(e.sender_id) and e.sender_id not in LOGIN_STATE and e.sender_id not in RANGE_WAIT_STATE and e.raw_text and ("t.me/" in e.raw_text or re.match(r"^-100\d+", e.raw_text.strip())) and not e.raw_text.startswith("/")))
 async def link_paste_h(event):
+    await open_clone_setup(event, event.raw_text.strip())
+
+async def open_clone_setup(event, raw_input: str):
     if ACTIVE_CLONE["running"]:
         return await event.reply("⚠️ **A clone job is already running!**")
 
@@ -912,15 +1191,14 @@ async def link_paste_h(event):
     if not dest:
         return await event.reply("⚠️ **First set your destination:** `/setdest <link or -100id>`")
 
-    src_target, parsed_max_id = parse_tg_target(event.raw_text.strip())
-    end_id = parsed_max_id or 0
+    src_target, start_id, end_id = parse_input_with_range(raw_input)
     default_w = int(cfg.get("parallel_workers", 2))
 
     key = str(int(time.time() * 1000))
     setup = {
         "source": src_target,
         "dest": dest,
-        "start_id": 1,
+        "start_id": start_id,
         "end_id": end_id,
         "workers": default_w
     }
@@ -936,9 +1214,11 @@ async def cb_h(event):
     if not is_admin(event.sender_id):
         return await event.answer("⛔ Admin only.", alert=True)
 
+    uid = event.sender_id
     data = event.data.decode("utf-8").replace(" ", "")
 
     if data == "ctrl:close":
+        RANGE_WAIT_STATE.pop(uid, None)
         return await event.delete()
 
     if data == "menu:help":
@@ -952,6 +1232,12 @@ async def cb_h(event):
             await asyncio.sleep(1.5)
         freed_bytes, files_removed = wipe_cache_folder()
         await event.answer(f"🧹 Cleaned {files_removed} files ({fmt_size(freed_bytes)})!", alert=True)
+        await event.delete()
+        return await start_h(event)
+
+    if data == "menu:clearresume":
+        RESUME_FILE.unlink(missing_ok=True)
+        await event.answer("🗑️ Saved resume checkpoint cleared!", alert=True)
         await event.delete()
         return await start_h(event)
 
@@ -976,6 +1262,32 @@ async def cb_h(event):
         save_config(cfg)
         await event.answer(f"⚡ Parallel speed set to {w}x")
         return await event.edit(build_setup_text(setup), buttons=build_setup_buttons(key, w))
+
+    if data.startswith("setr:"):
+        _, key = data.split(":")
+        setup = PENDING_SETUP.get(key)
+        if not setup:
+            return await event.answer("⚠️ Session expired, paste link again.", alert=True)
+        msg = await event.get_message()
+        RANGE_WAIT_STATE[uid] = {"key": key, "setup_msg": msg}
+        await event.answer("🔢 Send Start and End ID")
+        return await event.edit(
+            f"🔢 **Set Custom Message ID Range for `{setup['source']}`**\n\n"
+            f"Current Range: `{setup.get('start_id', 1)}` → `{setup.get('end_id') or 'End'}`\n\n"
+            "👇 **Send your desired range now in any format:**\n"
+            "• `100 - 500` or `100 500` *(Clones from ID 100 to 500)*\n"
+            "• `250` *(Starts at ID 250 and clones to the end)*\n"
+            "• Or paste two post links (`https://t.me/c/xxx/100 https://t.me/c/xxx/500`)",
+            buttons=[[Button.inline("🔙 Back to Setup Menu", f"backr:{key}".encode())]]
+        )
+
+    if data.startswith("backr:"):
+        _, key = data.split(":")
+        RANGE_WAIT_STATE.pop(uid, None)
+        setup = PENDING_SETUP.get(key)
+        if not setup:
+            return await event.answer("⚠️ Session expired.", alert=True)
+        return await event.edit(build_setup_text(setup), buttons=build_setup_buttons(key, setup["workers"]))
 
     if data == "menu:qr":
         await event.answer()
@@ -1010,6 +1322,7 @@ async def cb_h(event):
         return await event.answer("🛑 Stopping workers & wiping cache...", alert=True)
 
     if data.startswith("go:"):
+        RANGE_WAIT_STATE.pop(uid, None)
         _, key, filter_mode, action_mode = data.split(":")
         setup = PENDING_SETUP.pop(key, None)
         if not setup:
@@ -1025,16 +1338,23 @@ if __name__ == "__main__":
     bot.run_until_disconnected()
 PY_EOF
 
-echo "=========================================================="
+echo "======================================================================"
 echo " 🛠️ Creating Terminal SSH Manager (clone-bot)..."
-echo "=========================================================="
+echo "======================================================================"
 cat << 'CLI_EOF' > "$CLI_BIN"
 #!/bin/bash
 while true; do
     clear
-    echo "=================================================="
-    echo "       🤖 BOTS BY SPW - CLONER SSH MANAGER        "
-    echo "=================================================="
+    cat << "BANNER"
+======================================================================
+  ____   ___ _____ ____    ____  __   __  ____  ______        __
+ | __ ) / _ \_   _/ ___|  | __ ) \ \ / / / ___||  _ \ \      / /
+ |  _ \| | | || | \___ \  |  _ \  \ V /  \___ \| |_) \ \ /\ / / 
+ | |_) | |_| || |  ___) | | |_) |  | |    ___) |  __/ \ V  V /  
+ |____/ \___/ |_| |____/  |____/   |_|   |____/|_|     \_/\_/   
+                 CLONER BOT - SSH MANAGEMENT MENU
+======================================================================
+BANNER
     echo "1) Check Service Status"
     echo "2) View Live Logs (Ctrl+C to exit)"
     echo "3) Restart Bot Service"
@@ -1043,7 +1363,7 @@ while true; do
     echo "6) Edit config.json Credentials"
     echo "7) Uninstall Cloner Bot"
     echo "0) Exit"
-    echo "=================================================="
+    echo "======================================================================"
     read -rp "Select an option [0-7]: " choice
     case $choice in
         1) systemctl status clonebot --no-pager; read -rp "Press Enter..." ;;
@@ -1071,14 +1391,14 @@ done
 CLI_EOF
 chmod +x "$CLI_BIN"
 
-echo "=========================================================="
+echo "======================================================================"
 echo " ⚡ Configuring & Starting systemd Service..."
-echo "=========================================================="
+echo "======================================================================"
 /opt/clonebot/venv/bin/python -m py_compile "$INSTALL_DIR/cloner.py"
 
 cat << 'SVC_EOF' > "$SERVICE_FILE"
 [Unit]
-Description=BOTS BY SPW Telegram Mass Cloner Bot
+Description=BOTS BY SPW Telegram Parallel Album & Range Cloner Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -1099,9 +1419,10 @@ systemctl enable clonebot
 systemctl restart clonebot
 
 echo ""
-echo "=========================================================="
+echo "======================================================================"
 echo " ✅ BOTS BY SPW — INSTALLATION COMPLETE!"
-echo "=========================================================="
+echo "======================================================================"
 echo " • Bot Status : $(systemctl is-active clonebot)"
 echo " • SSH Menu   : Type 'clone-bot' anytime in terminal"
-echo "=========================================================="
+echo " • In-Bot Help: Send /start or /help to your bot on Telegram"
+echo "======================================================================"
