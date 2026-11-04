@@ -16,7 +16,7 @@ cat << "BANNER_EOF"
  | |_) | |_| || |  ___) | | |_) |  | |    ___) |  __/ \ V  V /  
  |____/ \___/ |_| |____/  |____/   |_|   |____/|_|     \_/\_/   
                                                                 
-   ⚡ PARALLEL TEMP-CACHE, ALBUM & RANGE CHANNEL CLONER BOT ⚡
+   ⚡ PERFECT-ORDER & RESTRICTED BOT CLONER + BANDWIDTH METER ⚡
 ======================================================================
 BANNER_EOF
 
@@ -26,11 +26,14 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo ""
-echo "💡 RECOMMENDED SETTINGS & FEATURES:"
-echo " • Parallel Workers : 2x to 4x is recommended to avoid Telegram FloodWaits."
-echo " • Custom ID Range  : Clone specific message ranges (Start ID -> End ID)."
-echo " • Album Support    : Automatically keeps multi-photo/video albums grouped."
-echo " • Zero Disk Bloating: Cached files are wiped immediately after each upload."
+echo "💡 KEY FEATURES & ENGINE OVERVIEW:"
+echo " • Strict 1->N Order : Streams and publishes posts in exact sequential order."
+echo " • Bot Chat Unlocker : Extracts save-restricted media from other Telegram bots (/bots)."
+echo " • Parallel Staging  : Pre-uploads media & albums in parallel (1x to 8x)."
+echo " • Album Preservation: Keeps multi-photo/video grids & captions grouped."
+echo " • Size Filter       : Automatically skips files larger than your MB limit."
+echo " • Bandwidth Meter   : Real-time Download/Upload speeds, Peak & Total GB."
+echo " • Zero Disk Bloat   : Cached files are wiped immediately after each post."
 echo "======================================================================"
 
 mkdir -p "$INSTALL_DIR" "$CACHE_DIR"
@@ -48,6 +51,8 @@ if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
     read -rp "👉 Enter API_HASH (e.g. a1b2c3d4e5f6...): " INPUT_API_HASH
     read -rp "👉 Enter BOT_TOKEN (from @BotFather): " INPUT_BOT_TOKEN
     read -rp "👉 Enter ADMIN_IDS (space-separated, e.g. 111111111 222222222): " INPUT_ADMINS
+    read -rp "👉 Enter Max File Size Limit in MB [default: 150]: " INPUT_MAX_MB
+    INPUT_MAX_MB=${INPUT_MAX_MB:-150}
 
     ADMIN_JSON=$(echo "$INPUT_ADMINS" | tr ',' ' ' | awk '{
         printf "[";
@@ -64,8 +69,9 @@ if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
     "bot_token": "$INPUT_BOT_TOKEN",
     "admin_ids": $ADMIN_JSON,
     "dest_chat": null,
-    "delay_seconds": 1.5,
-    "parallel_workers": 2
+    "delay_seconds": 0.4,
+    "parallel_workers": 3,
+    "max_file_size_mb": $INPUT_MAX_MB
 }
 CONFIG_EOF
     chmod 600 "$CONFIG_FILE"
@@ -103,6 +109,7 @@ import shutil
 import asyncio
 import logging
 import subprocess
+from collections import deque
 from pathlib import Path
 
 import qrcode
@@ -113,8 +120,10 @@ from telethon.errors import (
     ChatForwardsRestrictedError,
 )
 from telethon.tl.types import (
+    User,
     MessageService,
     DocumentAttributeVideo,
+    DocumentAttributeFilename,
     MessageMediaPhoto,
     MessageMediaDocument,
 )
@@ -129,7 +138,8 @@ BOT_SESSION_PATH = str(BASE_DIR / "bot_session")
 shutil.rmtree(CACHE_DIR, ignore_errors=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+PHOTO_EXTS = {".jpg", ".jpeg", ".png"}
 MAX_WORKERS_LIMIT = 10
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -138,8 +148,9 @@ def load_config():
     with open(CONFIG_FILE, "r") as f:
         data = json.load(f)
     data.setdefault("dest_chat", None)
-    data.setdefault("delay_seconds", 1.5)
-    data.setdefault("parallel_workers", 2)
+    data.setdefault("delay_seconds", 0.4)
+    data.setdefault("parallel_workers", 3)
+    data.setdefault("max_file_size_mb", 150)
     return data
 
 def save_config(data):
@@ -195,6 +206,71 @@ LOGIN_STATE = {}
 RANGE_WAIT_STATE = {}
 WORKER_STATUS = {}
 
+# ================= LIVE DOWNLOAD & UPLOAD BANDWIDTH METER =================
+
+class BandwidthMeter:
+    def __init__(self, window_sec: float = 4.0):
+        self.window_sec = window_sec
+        self.dl_samples = deque()
+        self.ul_samples = deque()
+        self.total_dl_bytes = 0
+        self.total_ul_bytes = 0
+        self.peak_dl_bps = 0.0
+        self.peak_ul_bps = 0.0
+
+    def reset_job(self):
+        self.dl_samples.clear()
+        self.ul_samples.clear()
+        self.total_dl_bytes = 0
+        self.total_ul_bytes = 0
+        self.peak_dl_bps = 0.0
+        self.peak_ul_bps = 0.0
+
+    def record_dl(self, delta_bytes: int):
+        if delta_bytes <= 0:
+            return
+        now = time.time()
+        self.total_dl_bytes += delta_bytes
+        self.dl_samples.append((now, delta_bytes))
+        self._prune(self.dl_samples, now)
+
+    def record_ul(self, delta_bytes: int):
+        if delta_bytes <= 0:
+            return
+        now = time.time()
+        self.total_ul_bytes += delta_bytes
+        self.ul_samples.append((now, delta_bytes))
+        self._prune(self.ul_samples, now)
+
+    def _prune(self, dq: deque, now: float):
+        cutoff = now - self.window_sec
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+    def get_dl_speed(self) -> float:
+        now = time.time()
+        self._prune(self.dl_samples, now)
+        if not self.dl_samples:
+            return 0.0
+        span = max(0.5, now - self.dl_samples[0][0])
+        spd = sum(b for _, b in self.dl_samples) / span
+        if spd > self.peak_dl_bps:
+            self.peak_dl_bps = spd
+        return spd
+
+    def get_ul_speed(self) -> float:
+        now = time.time()
+        self._prune(self.ul_samples, now)
+        if not self.ul_samples:
+            return 0.0
+        span = max(0.5, now - self.ul_samples[0][0])
+        spd = sum(b for _, b in self.ul_samples) / span
+        if spd > self.peak_ul_bps:
+            self.peak_ul_bps = spd
+        return spd
+
+BW = BandwidthMeter()
+
 def is_admin(uid: int) -> bool:
     return uid in ADMINS
 
@@ -206,6 +282,15 @@ def fmt_size(b: float) -> str:
             return f"{b:.2f} {u}"
         b /= 1024.0
     return f"{b:.2f} PB"
+
+def get_media_size_bytes(msg) -> int:
+    if not msg or not getattr(msg, "media", None):
+        return 0
+    if getattr(msg, "file", None) and getattr(msg.file, "size", None):
+        return int(msg.file.size)
+    if isinstance(msg.media, MessageMediaDocument) and getattr(msg.media, "document", None):
+        return int(getattr(msg.media.document, "size", 0) or 0)
+    return 0
 
 def get_dir_size(path_obj: Path) -> int:
     total = 0
@@ -275,35 +360,39 @@ def parse_tg_target(raw: str):
     if re.match(r"^-?\d+$", text):
         return int(text), None
 
+    if text.startswith("@") and len(text) > 1:
+        return text[1:], None
+
     m_priv = re.search(r"t\.me/c/(\d+)(?:/(\d+))?", text)
     if m_priv:
         chat_id = int(f"-100{m_priv.group(1)}")
-        max_id = int(m_priv.group(2)) if m_priv.group(2) else None
-        return chat_id, max_id
+        msg_id = int(m_priv.group(2)) if m_priv.group(2) else None
+        return chat_id, msg_id
 
     m_pub = re.search(r"t\.me/([a-zA-Z0-9_]+)(?:/(\d+))?", text)
     if m_pub and m_pub.group(1).lower() not in ("c", "joinchat"):
         uname = m_pub.group(1)
-        max_id = int(m_pub.group(2)) if m_pub.group(2) else None
-        return uname, max_id
+        msg_id = int(m_pub.group(2)) if m_pub.group(2) else None
+        return uname, msg_id
 
     return text, None
 
 def parse_input_with_range(raw_text: str):
     tokens = raw_text.strip().split()
-    links = [t for t in tokens if "t.me/" in t or re.match(r"^-100\d+$", t)]
+    links = [t for t in tokens if "t.me/" in t or t.startswith("@") or re.match(r"^-?\d+$", t)]
     if not links:
         target, mid = parse_tg_target(tokens[0])
-        return target, 1, (mid or 0)
+        end_val = 0 if (mid is None or mid <= 1) else mid
+        return target, 1, end_val
 
-    if len(links) >= 2:
+    if len(links) >= 2 and ("t.me/" in links[0] and "t.me/" in links[1]):
         t1, id1 = parse_tg_target(links[0])
         _, id2 = parse_tg_target(links[1])
         if id1 and id2:
             return t1, min(id1, id2), max(id1, id2)
 
     target, link_msg_id = parse_tg_target(links[0])
-    remainder = raw_text.replace(links[0], " ")
+    remainder = raw_text.replace(links[0], " ", 1)
     nums = [int(x) for x in re.findall(r"\b\d+\b", remainder)]
 
     if len(nums) >= 2:
@@ -314,7 +403,8 @@ def parse_input_with_range(raw_text: str):
             return target, max(1, nums[0]), link_msg_id
         return target, max(1, nums[0]), 0
 
-    return target, 1, (link_msg_id or 0)
+    end_val = 0 if (link_msg_id is None or link_msg_id <= 1) else link_msg_id
+    return target, 1, end_val
 
 async def is_user_logged_in() -> bool:
     try:
@@ -323,6 +413,36 @@ async def is_user_logged_in() -> bool:
         return await user_client.is_user_authorized()
     except Exception:
         return False
+
+async def inspect_source_bounds(src_target):
+    info = {
+        "is_private_or_bot": False,
+        "title": str(src_target),
+        "first_id": 1,
+        "last_id": 0
+    }
+    if not await is_user_logged_in():
+        return info
+    try:
+        entity = await user_client.get_entity(src_target)
+        if isinstance(entity, User):
+            info["is_private_or_bot"] = True
+            uname = f"@{entity.username}" if getattr(entity, "username", None) else ""
+            tag = "🤖 Bot" if getattr(entity, "bot", False) else "👤 Chat"
+            info["title"] = f"{tag}: {entity.first_name or ''} {uname}".strip()
+        else:
+            info["title"] = getattr(entity, "title", str(src_target))
+
+        latest = await user_client.get_messages(entity, limit=1)
+        if latest and latest[0]:
+            info["last_id"] = latest[0].id
+
+        oldest = await user_client.get_messages(entity, limit=1, reverse=True)
+        if oldest and oldest[0]:
+            info["first_id"] = oldest[0].id
+    except Exception as e:
+        logging.warning(f"Could not inspect source bounds for {src_target}: {e}")
+    return info
 
 def control_buttons():
     pause_label = "▶️ Resume" if ACTIVE_CLONE["paused"] else "⏸️ Pause"
@@ -333,39 +453,57 @@ def control_buttons():
         ]
     ]
 
-def build_setup_buttons(key: str, selected_workers: int):
+def build_setup_buttons(key: str, selected_workers: int, is_bot_dm: bool = False):
     worker_opts = [1, 2, 3, 4, 5, 8]
     w_row = []
     for w in worker_opts:
         label = f"✅ {w}x" if w == selected_workers else f"⚡ {w}x"
         w_row.append(Button.inline(label, f"setw:{key}:{w}".encode()))
 
-    return [
+    rows = [
         w_row[:3],
         w_row[3:],
-        [Button.inline("🔢 Set Custom ID Range (Start - End)", f"setr:{key}".encode())],
-        [Button.inline(f"💾 Cache & Upload Media + Albums ({selected_workers}x Parallel)", f"go:{key}:media:cache".encode())],
-        [Button.inline(f"💾 Cache & Upload All + Text ({selected_workers}x Parallel)", f"go:{key}:all:cache".encode())],
         [
-            Button.inline("📨 Direct Forward (Keep Tag)", f"go:{key}:media:fwd".encode()),
-            Button.inline("📋 Direct Copy (No Tag)", f"go:{key}:media:copy".encode())
+            Button.inline("🔢 Custom ID Range", f"setr:{key}".encode()),
+            Button.inline("🔄 Full History (Oldest→End)", f"setfull:{key}".encode())
+        ]
+    ]
+    if is_bot_dm:
+        rows.append([
+            Button.inline("📥 Last 10 Msgs", f"setlast:{key}:10".encode()),
+            Button.inline("📥 Last 25 Msgs", f"setlast:{key}:25".encode()),
+            Button.inline("📥 Last 100 Msgs", f"setlast:{key}:100".encode())
+        ])
+
+    rows.extend([
+        [Button.inline(f"🔓 Unlock & Clone Media + Albums ({selected_workers}x)", f"go:{key}:media:cache".encode())],
+        [Button.inline(f"🔓 Unlock & Clone All + Text ({selected_workers}x)", f"go:{key}:all:cache".encode())],
+        [
+            Button.inline("📨 Ordered Forward (Tag)", f"go:{key}:media:fwd".encode()),
+            Button.inline("📋 Ordered Copy (No Tag)", f"go:{key}:media:copy".encode())
         ],
         [Button.inline("❌ Cancel", b"ctrl:close")]
-    ]
+    ])
+    return rows
 
 def build_setup_text(setup: dict) -> str:
+    cfg = load_config()
+    max_mb = cfg.get("max_file_size_mb", 150)
     s_id = setup.get("start_id", 1)
     end_id = setup.get("end_id", 0)
-    range_txt = f"`{s_id}` → `{end_id}` (`{max(1, end_id - s_id + 1)}` msgs)" if end_id > 0 else f"`{s_id}` → `Latest (Auto-Detect)`"
-    w = setup.get("workers", 2)
+    title = setup.get("title", setup["source"])
+    range_txt = f"`{s_id}` → `{end_id}`" if end_id > 0 else f"`{s_id}` → `Latest`"
+    w = setup.get("workers", 3)
     return (
-        f"🎯 **Source Group/Channel Ready!**\n\n"
-        f"📤 **Source:** `{setup['source']}`\n"
+        f"🎯 **Source Ready: {title}**\n\n"
+        f"📤 **Source ID/Handle:** `{setup['source']}`\n"
         f"📥 **Destination:** `{setup['dest']}`\n"
-        f"🔢 **Message Range:** {range_txt}\n"
-        f"🖼️ **Album Mode:** `Enabled (Preserves Media Groups)`\n"
-        f"⚡ **Parallel Workers:** `{w}x Concurrent`\n\n"
-        "💡 *Tap **🔢 Set Custom ID Range** to pick specific Start/End message IDs, or choose a Transfer Mode below:*"
+        f"🔢 **Message ID Range:** {range_txt}\n"
+        f"🔓 **Restricted Save (`noforwards`):** `Auto-Bypass via User Cache ✅`\n"
+        f"📏 **Max File Size Limit:** `Skip > {max_mb} MB`\n"
+        f"🖼️ **Albums & Captions:** `100% Preserved in Exact Order`\n"
+        f"⚡ **Parallel Staging Workers:** `{w}x Concurrent`\n\n"
+        "💡 *Protected bot/channel media is downloaded through your User Session cache and re-uploaded permanently in exact 1→2→3→4 order:*"
     )
 
 def get_video_meta(path: str):
@@ -396,68 +534,72 @@ def group_messages_into_units(msgs: list) -> list[list]:
     current_unit = []
     current_gid = None
 
-    for m in msgs:
+    for m in sorted(msgs, key=lambda x: x.id):
         gid = getattr(m, "grouped_id", None)
         if gid is not None:
             if current_gid == gid and len(current_unit) < 10:
                 current_unit.append(m)
             else:
                 if current_unit:
-                    units.append(current_unit)
+                    units.append(sorted(current_unit, key=lambda x: x.id))
                 current_unit = [m]
                 current_gid = gid
         else:
             if current_unit:
-                units.append(current_unit)
+                units.append(sorted(current_unit, key=lambda x: x.id))
                 current_unit = []
                 current_gid = None
             units.append([m])
 
     if current_unit:
-        units.append(current_unit)
+        units.append(sorted(current_unit, key=lambda x: x.id))
     return units
 
-async def cache_and_upload_unit(dl_client, up_client, dest_entity, unit: list) -> int:
+# ================= STAGE 2: PARALLEL DOWNLOAD & CLOUD PRE-UPLOAD =================
+
+async def stage_unit_files(dl_client, up_client, unit: list) -> dict | None:
     first_id = unit[0].id
     is_album = len(unit) > 1
     unit_cache_dir = CACHE_DIR / f"unit_{first_id}"
     unit_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
-            await asyncio.sleep(1)
-        if ACTIVE_CLONE["cancelled"]:
-            return 0
+    while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
+        await asyncio.sleep(1)
+    if ACTIVE_CLONE["cancelled"]:
+        return None
 
-        if is_album:
-            cached_files = []
-            captions = []
-            total_items = len(unit)
+    if is_album:
+        valid_album_msgs = [
+            m for m in sorted(unit, key=lambda x: x.id)
+            if isinstance(m.media, (MessageMediaPhoto, MessageMediaDocument))
+        ]
+        if not valid_album_msgs:
+            return None
 
-            for idx, m in enumerate(unit, 1):
-                while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
-                    await asyncio.sleep(1)
+        total_items = len(valid_album_msgs)
+        album_sem = asyncio.Semaphore(3)
+        local_paths = [None] * total_items
+        preuploaded_handles = [None] * total_items
+        is_photo_flags = [False] * total_items
+        captions = [(m.message if getattr(m, "message", None) is not None else (m.text or "")) for m in valid_album_msgs]
+
+        async def dl_and_stage_album_item(idx: int, m):
+            async with album_sem:
                 if ACTIVE_CLONE["cancelled"]:
-                    return 0
-
-                if not isinstance(m.media, (MessageMediaPhoto, MessageMediaDocument)):
-                    continue
-
+                    return
                 item_prefix = unit_cache_dir / f"{idx:02d}_msg_{m.id}"
                 t0 = time.time()
-                WORKER_STATUS[first_id] = {
-                    "stage": f"📥 Caching Album ({idx}/{total_items})",
-                    "curr": 0,
-                    "tot": 0,
-                    "speed": 0.0
-                }
+                last_dl = 0
 
-                def dl_prog(curr, tot, i=idx):
+                def dl_prog(curr, tot):
+                    nonlocal last_dl
                     if ACTIVE_CLONE["cancelled"]:
                         raise asyncio.CancelledError()
+                    BW.record_dl(curr - last_dl)
+                    last_dl = curr
                     spd = curr / max(0.1, time.time() - t0)
                     WORKER_STATUS[first_id] = {
-                        "stage": f"📥 Album ({i}/{total_items})",
+                        "stage": f"📥 Album ({idx + 1}/{total_items})",
                         "curr": curr,
                         "tot": tot,
                         "speed": spd
@@ -480,35 +622,271 @@ async def cache_and_upload_unit(dl_client, up_client, dest_entity, unit: list) -
                         }
                         await asyncio.sleep(fw.seconds + 2)
 
-                if fpath and os.path.exists(fpath) and os.path.getsize(fpath) > 0:
-                    cached_files.append(fpath)
-                    captions.append(m.text or "")
+                if not fpath or not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
+                    return
 
-            if not cached_files:
-                return 0
+                local_paths[idx] = fpath
+                ext = os.path.splitext(fpath)[1].lower()
+                is_photo = isinstance(m.media, MessageMediaPhoto) or (ext in PHOTO_EXTS and not isinstance(m.media, MessageMediaDocument))
+                is_photo_flags[idx] = is_photo
 
-            while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
-                await asyncio.sleep(1)
+                if is_photo:
+                    up_t0 = time.time()
+                    last_ul = 0
+
+                    def up_prog(curr, tot):
+                        nonlocal last_ul
+                        if ACTIVE_CLONE["cancelled"]:
+                            raise asyncio.CancelledError()
+                        BW.record_ul(curr - last_ul)
+                        last_ul = curr
+                        spd = curr / max(0.1, time.time() - up_t0)
+                        WORKER_STATUS[first_id] = {
+                            "stage": f"☁️ Pre-Upload ({idx + 1}/{total_items})",
+                            "curr": curr,
+                            "tot": tot,
+                            "speed": spd
+                        }
+
+                    while True:
+                        try:
+                            handle = await up_client.upload_file(
+                                fpath,
+                                file_name=os.path.basename(fpath),
+                                progress_callback=up_prog
+                            )
+                            preuploaded_handles[idx] = handle
+                            break
+                        except FloodWaitError as fw:
+                            await asyncio.sleep(fw.seconds + 2)
+
+        await asyncio.gather(
+            *(dl_and_stage_album_item(i, m) for i, m in enumerate(valid_album_msgs))
+        )
+
+        final_local = []
+        final_handles = []
+        final_captions = []
+        all_preuploaded_photos = True
+
+        for lp, fh, is_ph, cap in zip(local_paths, preuploaded_handles, is_photo_flags, captions):
+            if lp and os.path.exists(lp):
+                final_local.append(lp)
+                final_captions.append(cap)
+                if is_ph and fh is not None:
+                    final_handles.append(fh)
+                else:
+                    all_preuploaded_photos = False
+
+        if not final_local:
+            return None
+
+        WORKER_STATUS[first_id] = {
+            "stage": f"✅ Album Ready ({len(final_local)} items)",
+            "curr": 1,
+            "tot": 1,
+            "speed": 0.0
+        }
+        return {
+            "kind": "album",
+            "unit_cache_dir": unit_cache_dir,
+            "local_paths": final_local,
+            "input_files": final_handles if all_preuploaded_photos else None,
+            "captions": final_captions,
+            "count": len(final_local)
+        }
+
+    msg = unit[0]
+    if msg.media:
+        if not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
+            if msg.message or msg.text:
+                return {
+                    "kind": "text",
+                    "unit_cache_dir": unit_cache_dir,
+                    "text": msg.message or msg.text,
+                    "entities": msg.entities,
+                    "count": 1
+                }
+            return None
+
+        item_prefix = unit_cache_dir / f"msg_{msg.id}"
+        t0 = time.time()
+        last_dl = 0
+
+        def dl_prog(curr, tot):
+            nonlocal last_dl
             if ACTIVE_CLONE["cancelled"]:
-                return 0
-
-            total_album_bytes = sum(os.path.getsize(f) for f in cached_files)
-            up_t0 = time.time()
+                raise asyncio.CancelledError()
+            BW.record_dl(curr - last_dl)
+            last_dl = curr
+            spd = curr / max(0.1, time.time() - t0)
             WORKER_STATUS[first_id] = {
-                "stage": f"📤 Uploading Album ({len(cached_files)} items)",
-                "curr": 0,
-                "tot": total_album_bytes,
-                "speed": 0.0
+                "stage": "📥 Caching Restricted Media",
+                "curr": curr,
+                "tot": tot,
+                "speed": spd
             }
 
-            def up_prog(curr, tot):
+        while True:
+            try:
+                cached_file = await dl_client.download_media(
+                    msg,
+                    file=str(item_prefix),
+                    progress_callback=dl_prog
+                )
+                break
+            except FloodWaitError as fw:
+                WORKER_STATUS[first_id] = {
+                    "stage": f"⏳ FloodWait ({fw.seconds}s)",
+                    "curr": 0,
+                    "tot": 0,
+                    "speed": 0.0
+                }
+                await asyncio.sleep(fw.seconds + 2)
+
+        if not cached_file or not os.path.exists(cached_file) or os.path.getsize(cached_file) == 0:
+            return None
+
+        ext = os.path.splitext(cached_file)[1].lower()
+        is_video = ext in VIDEO_EXTS
+        is_force_doc = (
+            isinstance(msg.media, MessageMediaDocument)
+            and not is_video
+            and not isinstance(msg.media, MessageMediaPhoto)
+        )
+
+        attrs = []
+        thumb_file = None
+        if is_video:
+            d, w, h = await asyncio.to_thread(get_video_meta, cached_file)
+            attrs.append(DocumentAttributeVideo(duration=d, w=w, h=h, supports_streaming=True))
+            thumb_file = await asyncio.to_thread(
+                make_thumb, cached_file, str(unit_cache_dir / f"thumb_{msg.id}.jpg")
+            )
+
+        fsize = os.path.getsize(cached_file)
+        up_t0 = time.time()
+        last_ul = 0
+
+        def up_prog(curr, tot):
+            nonlocal last_ul
+            if ACTIVE_CLONE["cancelled"]:
+                raise asyncio.CancelledError()
+            BW.record_ul(curr - last_ul)
+            last_ul = curr
+            spd = curr / max(0.1, time.time() - up_t0)
+            WORKER_STATUS[first_id] = {
+                "stage": "☁️ Pre-Uploading",
+                "curr": curr,
+                "tot": tot,
+                "speed": spd
+            }
+
+        while True:
+            try:
+                input_file_handle = await up_client.upload_file(
+                    cached_file,
+                    file_name=os.path.basename(cached_file),
+                    progress_callback=up_prog
+                )
+                break
+            except FloodWaitError as fw:
+                WORKER_STATUS[first_id] = {
+                    "stage": f"⏳ FloodWait ({fw.seconds}s)",
+                    "curr": 0,
+                    "tot": fsize,
+                    "speed": 0.0
+                }
+                await asyncio.sleep(fw.seconds + 2)
+
+        WORKER_STATUS[first_id] = {
+            "stage": "✅ Pre-Uploaded (In Queue)",
+            "curr": 1,
+            "tot": 1,
+            "speed": 0.0
+        }
+        return {
+            "kind": "single_media",
+            "unit_cache_dir": unit_cache_dir,
+            "local_path": cached_file,
+            "input_file": input_file_handle,
+            "thumb": thumb_file,
+            "attrs": attrs if attrs else None,
+            "is_video": is_video,
+            "force_document": is_force_doc,
+            "caption": msg.message if getattr(msg, "message", None) is not None else (msg.text or ""),
+            "entities": msg.entities,
+            "count": 1
+        }
+
+    elif msg.message or msg.text:
+        return {
+            "kind": "text",
+            "unit_cache_dir": unit_cache_dir,
+            "text": msg.message if getattr(msg, "message", None) is not None else msg.text,
+            "entities": msg.entities,
+            "count": 1
+        }
+
+    return None
+
+# ================= STAGE 3: STRICT 1->N SEQUENTIAL PUBLISHER =================
+
+async def publish_staged_slot(up_client, dest_entity, first_id: int, payload: dict) -> int:
+    if not payload:
+        return 0
+    unit_cache_dir = payload.get("unit_cache_dir")
+
+    try:
+        while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
+            await asyncio.sleep(1)
+        if ACTIVE_CLONE["cancelled"]:
+            return 0
+
+        kind = payload["kind"]
+
+        if kind == "album":
+            captions = payload["captions"]
+            input_files = payload.get("input_files")
+            local_paths = payload["local_paths"]
+
+            if input_files:
+                WORKER_STATUS[first_id] = {
+                    "stage": f"📤 Publishing Album ({len(input_files)} items)",
+                    "curr": 1,
+                    "tot": 1,
+                    "speed": 0.0
+                }
+                try:
+                    while True:
+                        try:
+                            await up_client.send_file(
+                                dest_entity,
+                                file=input_files,
+                                caption=captions
+                            )
+                            return int(payload["count"])
+                        except FloodWaitError as fw:
+                            await asyncio.sleep(fw.seconds + 2)
+                except Exception as e:
+                    logging.info(f"Album pre-upload handle fallback to local paths for {first_id}: {e}")
+
+            total_bytes = sum(os.path.getsize(p) for p in local_paths if os.path.exists(p))
+            up_t0 = time.time()
+            last_ul = 0
+
+            def alb_up_prog(curr, tot):
+                nonlocal last_ul
                 if ACTIVE_CLONE["cancelled"]:
                     raise asyncio.CancelledError()
+                if curr > last_ul:
+                    BW.record_ul(curr - last_ul)
+                last_ul = curr
                 spd = curr / max(0.1, time.time() - up_t0)
                 WORKER_STATUS[first_id] = {
-                    "stage": f"📤 Album ({len(cached_files)} items)",
+                    "stage": f"📤 Uploading Album ({len(local_paths)} items)",
                     "curr": curr,
-                    "tot": tot,
+                    "tot": tot or total_bytes,
                     "speed": spd
                 }
 
@@ -516,124 +894,208 @@ async def cache_and_upload_unit(dl_client, up_client, dest_entity, unit: list) -
                 try:
                     await up_client.send_file(
                         dest_entity,
-                        file=cached_files,
+                        file=local_paths,
                         caption=captions,
                         supports_streaming=True,
-                        progress_callback=up_prog
+                        progress_callback=alb_up_prog
                     )
-                    break
+                    return int(payload["count"])
                 except FloodWaitError as fw:
-                    WORKER_STATUS[first_id] = {
-                        "stage": f"⏳ FloodWait ({fw.seconds}s)",
-                        "curr": 0,
-                        "tot": total_album_bytes,
-                        "speed": 0.0
-                    }
                     await asyncio.sleep(fw.seconds + 2)
 
-            return len(cached_files)
+        elif kind == "single_media":
+            WORKER_STATUS[first_id] = {
+                "stage": "📤 Publishing in Order...",
+                "curr": 1,
+                "tot": 1,
+                "speed": 0.0
+            }
+            try:
+                while True:
+                    try:
+                        await up_client.send_file(
+                            dest_entity,
+                            file=payload["input_file"],
+                            caption=payload["caption"],
+                            formatting_entities=payload["entities"],
+                            thumb=payload["thumb"],
+                            attributes=payload["attrs"],
+                            supports_streaming=payload["is_video"],
+                            force_document=payload["force_document"]
+                        )
+                        return 1
+                    except FloodWaitError as fw:
+                        await asyncio.sleep(fw.seconds + 2)
+            except Exception as e:
+                logging.info(f"Single pre-upload fallback to local path for {first_id}: {e}")
+                while True:
+                    try:
+                        await up_client.send_file(
+                            dest_entity,
+                            file=payload["local_path"],
+                            caption=payload["caption"],
+                            formatting_entities=payload["entities"],
+                            thumb=payload["thumb"],
+                            attributes=payload["attrs"],
+                            supports_streaming=payload["is_video"],
+                            force_document=payload["force_document"]
+                        )
+                        return 1
+                    except FloodWaitError as fw:
+                        await asyncio.sleep(fw.seconds + 2)
 
-        msg = unit[0]
-        if msg.media:
-            if not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
-                if msg.text:
-                    await up_client.send_message(dest_entity, msg.text, formatting_entities=msg.entities)
-                    return 1
-                return 0
-
-            t0 = time.time()
-            WORKER_STATUS[first_id] = {"stage": "📥 Caching", "curr": 0, "tot": 0, "speed": 0.0}
-
-            def dl_prog(curr, tot):
-                if ACTIVE_CLONE["cancelled"]:
-                    raise asyncio.CancelledError()
-                spd = curr / max(0.1, time.time() - t0)
-                WORKER_STATUS[first_id] = {"stage": "📥 Caching", "curr": curr, "tot": tot, "speed": spd}
-
-            while True:
-                try:
-                    cached_file = await dl_client.download_media(
-                        msg,
-                        file=str(unit_cache_dir) + "/",
-                        progress_callback=dl_prog
-                    )
-                    break
-                except FloodWaitError as fw:
-                    WORKER_STATUS[first_id] = {"stage": f"⏳ FloodWait ({fw.seconds}s)", "curr": 0, "tot": 0, "speed": 0.0}
-                    await asyncio.sleep(fw.seconds + 2)
-
-            if not cached_file or not os.path.exists(cached_file):
-                return 0
-
-            ext = os.path.splitext(cached_file)[1].lower()
-            attrs = []
-            thumb_file = None
-            is_video = ext in VIDEO_EXTS
-            if is_video:
-                d, w, h = await asyncio.to_thread(get_video_meta, cached_file)
-                attrs.append(DocumentAttributeVideo(duration=d, w=w, h=h, supports_streaming=True))
-                thumb_file = await asyncio.to_thread(
-                    make_thumb, cached_file, str(unit_cache_dir / "thumb.jpg")
-                )
-
-            while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
-                await asyncio.sleep(1)
-            if ACTIVE_CLONE["cancelled"]:
-                return 0
-
-            up_t0 = time.time()
-            fsize = os.path.getsize(cached_file)
-            WORKER_STATUS[first_id] = {"stage": "📤 Uploading", "curr": 0, "tot": fsize, "speed": 0.0}
-
-            def up_prog(curr, tot):
-                if ACTIVE_CLONE["cancelled"]:
-                    raise asyncio.CancelledError()
-                spd = curr / max(0.1, time.time() - up_t0)
-                WORKER_STATUS[first_id] = {"stage": "📤 Uploading", "curr": curr, "tot": tot, "speed": spd}
-
-            while True:
-                try:
-                    await up_client.send_file(
-                        dest_entity,
-                        file=cached_file,
-                        caption=msg.text or "",
-                        formatting_entities=msg.entities,
-                        thumb=thumb_file,
-                        attributes=attrs if attrs else None,
-                        supports_streaming=is_video,
-                        progress_callback=up_prog
-                    )
-                    break
-                except FloodWaitError as fw:
-                    WORKER_STATUS[first_id] = {"stage": f"⏳ FloodWait ({fw.seconds}s)", "curr": 0, "tot": fsize, "speed": 0.0}
-                    await asyncio.sleep(fw.seconds + 2)
-
-            return 1
-
-        elif msg.text:
+        elif kind == "text":
+            WORKER_STATUS[first_id] = {
+                "stage": "📤 Sending Text Post...",
+                "curr": 1,
+                "tot": 1,
+                "speed": 0.0
+            }
             while True:
                 try:
                     await up_client.send_message(
                         dest_entity,
-                        msg.text,
-                        formatting_entities=msg.entities
+                        payload["text"],
+                        formatting_entities=payload["entities"]
                     )
-                    break
+                    return 1
                 except FloodWaitError as fw:
                     await asyncio.sleep(fw.seconds + 2)
-            return 1
 
         return 0
     finally:
-        WORKER_STATUS.pop(first_id, None)
-        shutil.rmtree(unit_cache_dir, ignore_errors=True)
+        if unit_cache_dir and os.path.exists(unit_cache_dir):
+            shutil.rmtree(unit_cache_dir, ignore_errors=True)
+
+# ================= MAIN CLONE RUNNER =================
+
+async def fetch_ordered_units_batch(
+    dl_client,
+    src_entity,
+    use_user: bool,
+    cursor_id: int,
+    end_id: int,
+    target_units_count: int,
+    media_only: bool,
+    max_bytes: int
+) -> tuple[list[list], int, int, int]:
+    skipped_other = 0
+    skipped_size = 0
+    collected_msgs = []
+    last_seen_id = cursor_id - 1
+
+    if use_user:
+        active_gid = None
+        iter_kwargs = {
+            "min_id": max(0, cursor_id - 1),
+            "reverse": True,
+        }
+        if end_id > 0:
+            iter_kwargs["max_id"] = end_id + 10
+
+        unit_counter = 0
+        async for m in dl_client.iter_messages(src_entity, **iter_kwargs):
+            if ACTIVE_CLONE["cancelled"]:
+                break
+            if m is None:
+                continue
+
+            gid = getattr(m, "grouped_id", None)
+            if end_id > 0 and m.id > end_id:
+                if gid is not None and gid == active_gid:
+                    pass
+                else:
+                    break
+
+            if unit_counter >= target_units_count and (gid is None or gid != active_gid):
+                break
+
+            last_seen_id = max(last_seen_id, m.id)
+
+            if isinstance(m, MessageService):
+                skipped_other += 1
+                continue
+            if media_only and not m.media:
+                skipped_other += 1
+                continue
+            if not m.media and not (m.message or m.text):
+                skipped_other += 1
+                continue
+
+            fsize_b = get_media_size_bytes(m)
+            if fsize_b > max_bytes:
+                skipped_size += 1
+                continue
+
+            if gid is None or gid != active_gid:
+                unit_counter += 1
+                active_gid = gid
+
+            collected_msgs.append(m)
+
+        units = group_messages_into_units(collected_msgs)
+        if not collected_msgs and unit_counter == 0:
+            return [], (end_id + 1 if end_id > 0 else last_seen_id + 1), skipped_other, skipped_size
+        return units, last_seen_id + 1, skipped_other, skipped_size
+
+    else:
+        chunk_span = max(50, target_units_count * 15)
+        batch_end = min(end_id, cursor_id + chunk_span - 1) if end_id > 0 else (cursor_id + chunk_span - 1)
+        id_list = list(range(cursor_id, batch_end + 1))
+
+        while True:
+            try:
+                msgs = await dl_client.get_messages(src_entity, ids=id_list)
+                break
+            except FloodWaitError as fw:
+                await asyncio.sleep(fw.seconds + 2)
+
+        sorted_msgs = sorted([m for m in (msgs or []) if m is not None], key=lambda x: x.id)
+        for m in sorted_msgs:
+            if isinstance(m, MessageService):
+                skipped_other += 1
+                continue
+            if media_only and not m.media:
+                skipped_other += 1
+                continue
+            if not m.media and not (m.message or m.text):
+                skipped_other += 1
+                continue
+            if get_media_size_bytes(m) > max_bytes:
+                skipped_size += 1
+                continue
+            collected_msgs.append(m)
+
+        if collected_msgs and getattr(collected_msgs[-1], "grouped_id", None) is not None:
+            last_gid = collected_msgs[-1].grouped_id
+            peek_ids = list(range(batch_end + 1, batch_end + 11))
+            while True:
+                try:
+                    peek_msgs = await dl_client.get_messages(src_entity, ids=peek_ids)
+                    break
+                except FloodWaitError as fw:
+                    await asyncio.sleep(fw.seconds + 2)
+            for pm in sorted([p for p in (peek_msgs or []) if p is not None], key=lambda x: x.id):
+                if getattr(pm, "grouped_id", None) == last_gid:
+                    batch_end = max(batch_end, pm.id)
+                    if get_media_size_bytes(pm) <= max_bytes:
+                        collected_msgs.append(pm)
+                    else:
+                        skipped_size += 1
+                else:
+                    break
+
+        units = group_messages_into_units(collected_msgs)
+        return units, batch_end + 1, skipped_other, skipped_size
 
 async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
     ACTIVE_CLONE["running"] = True
     ACTIVE_CLONE["paused"] = False
     ACTIVE_CLONE["cancelled"] = False
     WORKER_STATUS.clear()
+    BW.reset_job()
 
+    cfg = load_config()
     src_target = job_cfg["source"]
     dest_target = job_cfg["dest"]
     start_id = max(1, int(job_cfg.get("start_id", 1)))
@@ -641,8 +1103,10 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
     media_only = bool(job_cfg.get("media_only", True))
     mode = job_cfg.get("mode", "cache")
     drop_author = bool(job_cfg.get("drop_author", False))
-    workers = max(1, min(MAX_WORKERS_LIMIT, int(job_cfg.get("workers", load_config().get("parallel_workers", 2)))))
-    delay_sec = float(load_config().get("delay_seconds", 1.5))
+    workers = max(1, min(MAX_WORKERS_LIMIT, int(job_cfg.get("workers", cfg.get("parallel_workers", 3)))))
+    delay_sec = float(cfg.get("delay_seconds", 0.4))
+    max_mb = float(cfg.get("max_file_size_mb", 150))
+    max_bytes = int(max_mb * 1024 * 1024)
 
     use_user = await is_user_logged_in()
     dl_client = user_client if use_user else bot
@@ -650,14 +1114,14 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
     forwarded_total = int(job_cfg.get("forwarded_total", 0))
     albums_total = int(job_cfg.get("albums_total", 0))
     skipped_total = int(job_cfg.get("skipped_total", 0))
+    skipped_size_total = int(job_cfg.get("skipped_size_total", 0))
     t_start = time.time()
     current_scan_id = start_id
-    in_flight_ids = set()
     ui_running = True
 
     async def ui_updater_loop(total_range: int):
         while ui_running and not ACTIVE_CLONE["cancelled"]:
-            await asyncio.sleep(3.5)
+            await asyncio.sleep(3.0)
             if not ui_running:
                 break
             done_ids = max(0, current_scan_id - start_id)
@@ -665,6 +1129,9 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
             elapsed = time.time() - t_start
             rate = done_ids / max(0.1, elapsed)
             eta = max(0, end_id - current_scan_id) / max(0.01, rate)
+
+            dl_spd = BW.get_dl_speed()
+            ul_spd = BW.get_ul_speed()
 
             worker_lines = []
             for mid, st in sorted(WORKER_STATUS.items()):
@@ -676,17 +1143,20 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
                     f"• `ID {mid}` {st['stage']}: `[{progress_bar(c_bytes, t_bytes, 8)}] {w_pct:.0f}%` (`{fmt_size(spd)}/s`)"
                 )
 
-            active_block = "\n".join(worker_lines) if worker_lines else "• *Scanning next batch...*"
-            state_banner = "⏸️ **PAUSED**" if ACTIVE_CLONE["paused"] else f"🔄 **Cloning Media & Albums ({workers}x Parallel)...**"
+            active_block = "\n".join(worker_lines) if worker_lines else "• *Streaming next ordered batch...*"
+            state_banner = "⏸️ **PAUSED**" if ACTIVE_CLONE["paused"] else f"🚀 **Perfect-Order Cloning ({workers}x Parallel)...**"
 
             text = (
                 f"{state_banner}\n"
                 f"`[{progress_bar(done_ids, total_range, 12)}] {pct:.1f}%`\n\n"
-                f"✅ **Uploaded Files:** `{forwarded_total}` (🖼️ **Albums:** `{albums_total}`)\n"
-                f"⏭️ **Skipped:** `{skipped_total}` | 🔢 **Range:** `{start_id}` → `{end_id}` (At `{current_scan_id}`)\n"
-                f"🧹 **Active Temp Cache:** `{fmt_size(get_dir_size(CACHE_DIR))}`\n"
-                f"⏱️ **Elapsed:** `{fmt_time(elapsed)}` • **ETA:** `{fmt_time(eta)}`\n\n"
-                f"⚡ **Active Parallel Workers ({len(WORKER_STATUS)}/{workers}):**\n"
+                f"✅ **Published (1→N Order):** `{forwarded_total}` (🖼️ **Albums:** `{albums_total}`)\n"
+                f"📏 **Skipped (>{max_mb:.0f} MB):** `{skipped_size_total}` | ⏭️ **Skipped Other:** `{skipped_total}`\n"
+                f"🔢 **Source Progress:** `{current_scan_id}` / `{end_id}`\n\n"
+                f"📡 **Live Bandwidth Meter:**\n"
+                f"⬇️ **DL:** `{fmt_size(dl_spd)}/s` (Peak: `{fmt_size(BW.peak_dl_bps)}/s` | Total: `{fmt_size(BW.total_dl_bytes)}`)\n"
+                f"⬆️ **UL:** `{fmt_size(ul_spd)}/s` (Peak: `{fmt_size(BW.peak_ul_bps)}/s` | Total: `{fmt_size(BW.total_ul_bytes)}`)\n"
+                f"🧹 **VPS Cache:** `{fmt_size(get_dir_size(CACHE_DIR))}` | ⏱️ **ETA:** `{fmt_time(eta)}`\n\n"
+                f"⚡ **Active Workers ({len(WORKER_STATUS)}/{workers}):**\n"
                 f"{active_block}"
             )
             try:
@@ -697,6 +1167,7 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
     ui_task = None
     try:
         src_entity = await dl_client.get_entity(src_target)
+        chat_noforwards = bool(getattr(src_entity, "noforwards", False))
 
         try:
             dest_entity = await bot.get_entity(dest_target)
@@ -718,151 +1189,172 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
         total_range = max(1, end_id - start_id + 1)
         ui_task = asyncio.create_task(ui_updater_loop(total_range))
 
-        sem = asyncio.Semaphore(workers)
-        fetch_chunk_size = max(40, workers * 12)
+        target_units_per_batch = max(12, workers * 4)
 
-        async def process_one_unit(unit: list):
-            nonlocal forwarded_total, albums_total, skipped_total
-            unit_ids = [m.id for m in unit]
-            is_album = len(unit) > 1
+        while current_scan_id <= end_id:
+            if ACTIVE_CLONE["cancelled"]:
+                break
+            while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
+                await asyncio.sleep(1)
 
-            async with sem:
+            units, next_cursor_id, sk_other, sk_size = await fetch_ordered_units_batch(
+                dl_client=dl_client,
+                src_entity=src_entity,
+                use_user=use_user,
+                cursor_id=current_scan_id,
+                end_id=end_id,
+                target_units_count=target_units_per_batch,
+                media_only=media_only,
+                max_bytes=max_bytes
+            )
+            skipped_total += sk_other
+            skipped_size_total += sk_size
+
+            if not units:
+                if next_cursor_id <= current_scan_id:
+                    break
+                current_scan_id = next_cursor_id
+                continue
+
+            slots = [
+                {
+                    "unit": u,
+                    "first_id": u[0].id,
+                    "last_id": max(m.id for m in u),
+                    "is_album": len(u) > 1,
+                    "has_protected": chat_noforwards or any(
+                        bool(getattr(m, "noforwards", False)) or bool(getattr(getattr(m, "media", None), "ttl_seconds", None))
+                        for m in u
+                    ),
+                    "done": asyncio.Event(),
+                    "payload": None
+                }
+                for u in units
+            ]
+
+            preupload_sem = asyncio.Semaphore(workers)
+
+            async def producer_worker(slot: dict):
+                try:
+                    if mode == "cache" or slot["has_protected"]:
+                        slot["payload"] = await stage_unit_files(dl_client, up_client, slot["unit"])
+                    else:
+                        slot["payload"] = {"kind": "forward"}
+                except asyncio.CancelledError:
+                    slot["payload"] = None
+                except Exception as e:
+                    logging.warning(f"Staging unit {slot['first_id']} failed: {e}")
+                    slot["payload"] = None
+                finally:
+                    slot["done"].set()
+
+            async def launch_producers():
+                tasks = []
+                for s in slots:
+                    if ACTIVE_CLONE["cancelled"]:
+                        s["done"].set()
+                        continue
+                    await preupload_sem.acquire()
+                    if ACTIVE_CLONE["cancelled"]:
+                        preupload_sem.release()
+                        s["done"].set()
+                        continue
+                    tasks.append(asyncio.create_task(producer_worker(s)))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            producer_launcher = asyncio.create_task(launch_producers())
+
+            for slot in slots:
                 if ACTIVE_CLONE["cancelled"]:
-                    for uid_item in unit_ids:
-                        in_flight_ids.discard(uid_item)
-                    return
-                while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
-                    await asyncio.sleep(1)
-                if ACTIVE_CLONE["cancelled"]:
-                    for uid_item in unit_ids:
-                        in_flight_ids.discard(uid_item)
-                    return
+                    break
+                await slot["done"].wait()
+                first_id = slot["first_id"]
+                unit = slot["unit"]
+                unit_ids = [m.id for m in unit]
+                is_album = slot["is_album"]
 
                 try:
-                    if mode == "cache":
-                        sent_cnt = await cache_and_upload_unit(dl_client, up_client, dest_entity, unit)
-                        if sent_cnt > 0:
-                            forwarded_total += sent_cnt
-                            if is_album:
-                                albums_total += 1
-                        else:
-                            skipped_total += len(unit)
-                    else:
+                    if ACTIVE_CLONE["cancelled"]:
+                        break
+                    while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
+                        await asyncio.sleep(1)
+                    if ACTIVE_CLONE["cancelled"]:
+                        break
+
+                    payload = slot["payload"]
+                    if payload is None:
+                        skipped_total += len(unit)
+                    elif payload.get("kind") == "forward":
                         try:
-                            await dl_client.forward_messages(
-                                entity=dest_entity,
-                                messages=unit_ids,
-                                from_peer=src_entity,
-                                drop_author=drop_author
-                            )
+                            while True:
+                                try:
+                                    await dl_client.forward_messages(
+                                        entity=dest_entity,
+                                        messages=unit_ids,
+                                        from_peer=src_entity,
+                                        drop_author=drop_author
+                                    )
+                                    break
+                                except FloodWaitError as fw:
+                                    await asyncio.sleep(fw.seconds + 2)
                             forwarded_total += len(unit_ids)
                             if is_album:
                                 albums_total += 1
                         except ChatForwardsRestrictedError:
-                            sent_cnt = await cache_and_upload_unit(dl_client, up_client, dest_entity, unit)
+                            fallback_payload = await stage_unit_files(dl_client, up_client, unit)
+                            sent_cnt = await publish_staged_slot(up_client, dest_entity, first_id, fallback_payload)
                             if sent_cnt > 0:
                                 forwarded_total += sent_cnt
                                 if is_album:
                                     albums_total += 1
                             else:
                                 skipped_total += len(unit)
-                        except FloodWaitError as fw:
-                            await asyncio.sleep(fw.seconds + 2)
-                except asyncio.CancelledError:
-                    pass
+                    else:
+                        sent_cnt = await publish_staged_slot(up_client, dest_entity, first_id, payload)
+                        if sent_cnt > 0:
+                            forwarded_total += sent_cnt
+                            if is_album:
+                                albums_total += 1
+                        else:
+                            skipped_total += len(unit)
                 except Exception as e:
-                    logging.warning(f"Unit {unit_ids} failed: {e}")
+                    logging.warning(f"Sequential publish failed for unit {unit_ids}: {e}")
                     skipped_total += len(unit)
                 finally:
-                    for uid_item in unit_ids:
-                        in_flight_ids.discard(uid_item)
-                    safe_next_id = min(in_flight_ids) if in_flight_ids else (max(unit_ids) + 1)
-                    job_cfg["start_id"] = safe_next_id
+                    if payload and payload.get("unit_cache_dir"):
+                        shutil.rmtree(payload["unit_cache_dir"], ignore_errors=True)
+                    WORKER_STATUS.pop(first_id, None)
+                    preupload_sem.release()
+                    current_scan_id = slot["last_id"] + 1
+                    job_cfg["start_id"] = current_scan_id
                     job_cfg["end_id"] = end_id
                     job_cfg["forwarded_total"] = forwarded_total
                     job_cfg["albums_total"] = albums_total
                     job_cfg["skipped_total"] = skipped_total
+                    job_cfg["skipped_size_total"] = skipped_size_total
                     job_cfg["workers"] = workers
                     save_resume(job_cfg)
                     await asyncio.sleep(delay_sec)
 
-        batch_start = start_id
-        while batch_start <= end_id:
-            if ACTIVE_CLONE["cancelled"]:
-                break
-            while ACTIVE_CLONE["paused"] and not ACTIVE_CLONE["cancelled"]:
-                await asyncio.sleep(1)
-
-            batch_end = min(end_id, batch_start + fetch_chunk_size - 1)
-            id_list = list(range(batch_start, batch_end + 1))
-
-            while True:
-                try:
-                    msgs = await dl_client.get_messages(src_entity, ids=id_list)
-                    break
-                except FloodWaitError as fw:
-                    await asyncio.sleep(fw.seconds + 2)
-
-            valid_msgs = []
-            for m in (msgs or []):
-                if m is None or isinstance(m, MessageService):
-                    skipped_total += 1
-                    continue
-                if media_only and not m.media:
-                    skipped_total += 1
-                    continue
-                if not m.media and not m.text:
-                    skipped_total += 1
-                    continue
-                valid_msgs.append(m)
-
-            if valid_msgs and getattr(valid_msgs[-1], "grouped_id", None) is not None and batch_end < end_id:
-                last_gid = valid_msgs[-1].grouped_id
-                peek_ids = list(range(batch_end + 1, min(end_id, batch_end + 10) + 1))
-                if peek_ids:
-                    while True:
-                        try:
-                            peek_msgs = await dl_client.get_messages(src_entity, ids=peek_ids)
-                            break
-                        except FloodWaitError as fw:
-                            await asyncio.sleep(fw.seconds + 2)
-                    for pm in (peek_msgs or []):
-                        if pm is not None and getattr(pm, "grouped_id", None) == last_gid:
-                            valid_msgs.append(pm)
-                            batch_end = max(batch_end, pm.id)
-                        else:
-                            break
-
-            units = group_messages_into_units(valid_msgs)
-            for u in units:
-                for m in u:
-                    in_flight_ids.add(m.id)
-
-            if units:
-                tasks = [asyncio.create_task(process_one_unit(u)) for u in units]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-            current_scan_id = batch_end + 1
-            batch_start = batch_end + 1
-            if not in_flight_ids:
-                job_cfg["start_id"] = current_scan_id
-                job_cfg["end_id"] = end_id
-                job_cfg["forwarded_total"] = forwarded_total
-                job_cfg["albums_total"] = albums_total
-                job_cfg["skipped_total"] = skipped_total
-                job_cfg["workers"] = workers
-                save_resume(job_cfg)
+            producer_launcher.cancel()
+            current_scan_id = max(current_scan_id, next_cursor_id)
+            job_cfg["start_id"] = current_scan_id
+            save_resume(job_cfg)
 
         ui_running = False
         if ui_task:
             ui_task.cancel()
 
         wipe_cache_folder()
+        total_elapsed = max(0.1, time.time() - t_start)
 
         if ACTIVE_CLONE["cancelled"]:
             await status_msg.edit(
-                f"🛑 **Stopped at Message ID `{job_cfg['start_id']}` & Cache Wiped (`0.00 B`).**\n"
-                f"✅ **Total Uploaded:** `{forwarded_total}` (🖼️ **Albums:** `{albums_total}`)\n"
+                f"🛑 **Stopped at Message ID `{job_cfg['start_id']}` & Cache Wiped (`0.00 B`).**\n\n"
+                f"✅ **Published (In Order):** `{forwarded_total}` (🖼️ **Albums:** `{albums_total}`)\n"
+                f"📏 **Skipped (>{max_mb:.0f} MB):** `{skipped_size_total}`\n"
+                f"📡 **Total Transferred:** ⬇️ `{fmt_size(BW.total_dl_bytes)}` | ⬆️ `{fmt_size(BW.total_ul_bytes)}`\n"
                 "💡 *Send `/resume` anytime to continue from this exact message!*",
                 buttons=None
             )
@@ -870,13 +1362,16 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
             if RESUME_FILE.exists():
                 RESUME_FILE.unlink(missing_ok=True)
             await status_msg.edit(
-                f"🎉 **Cloning 100% Complete ({workers}x Parallel)!**\n\n"
-                f"🔢 **Cloned Range:** `{start_id}` → `{end_id}`\n"
-                f"✅ **Total Uploaded Files:** `{forwarded_total}`\n"
-                f"🖼️ **Combined Albums Uploaded:** `{albums_total}`\n"
-                f"⏭️ **Skipped:** `{skipped_total}`\n"
+                f"🎉 **Perfect-Order Cloning 100% Complete ({workers}x Parallel)!**\n\n"
+                f"🔢 **Cloned Range (1→N Order):** `{start_id}` → `{end_id}`\n"
+                f"✅ **Total Published Files:** `{forwarded_total}`\n"
+                f"🖼️ **Combined Albums Published:** `{albums_total}`\n"
+                f"📏 **Skipped (>{max_mb:.0f} MB):** `{skipped_size_total}` | ⏭️ **Other Skipped:** `{skipped_total}`\n\n"
+                f"📡 **Bandwidth Summary:**\n"
+                f"⬇️ **Downloaded:** `{fmt_size(BW.total_dl_bytes)}` (Peak: `{fmt_size(BW.peak_dl_bps)}/s`)\n"
+                f"⬆️ **Uploaded:** `{fmt_size(BW.total_ul_bytes)}` (Peak: `{fmt_size(BW.peak_ul_bps)}/s`)\n"
                 f"🧹 **VPS Cache Folder:** `0.00 B (Clean)`\n"
-                f"⏱️ **Total Time:** `{fmt_time(time.time() - t_start)}`",
+                f"⏱️ **Total Time:** `{fmt_time(total_elapsed)}`",
                 buttons=None
             )
     except Exception as e:
@@ -897,21 +1392,15 @@ async def run_clone_job(chat_id: int, status_msg, job_cfg: dict):
         ACTIVE_CLONE["task"] = None
 
 HELP_INSTRUCTIONS = (
-    "📖 **BOTS BY SPW — Parallel, Album & Range Cloner Guide**\n\n"
-    "**1. Connect a User Account (Recommended):**\n"
-    "• Send **`/qr`** and scan the QR code from **Telegram → Settings → Devices → Link Desktop Device** (No OTP needed!).\n"
-    "• Or send **`/login`** to sign in with a phone number.\n\n"
-    "**2. Set Your Destination Channel or Group:**\n"
-    "• Make sure this Bot is an **Admin** in your destination Channel/Group.\n"
-    "• Send `/setdest https://t.me/your_channel` or `/setdest -100xxxxxxxxxx`.\n\n"
-    "**3. Select Custom Message Range & Clone:**\n"
-    "• **Method A (Interactive Button):** Paste any channel/group link and tap **🔢 Set Custom ID Range (Start - End)**.\n"
-    "• **Method B (Paste Two Links):** Paste both the start post link and end post link in one message (e.g. `https://t.me/c/123/100 https://t.me/c/123/500`).\n"
-    "• **Method C (Command):** `/clone <link> <start_id> <end_id>`\n\n"
-    "**4. Maintenance Commands:**\n"
-    "• `/cleancache` (or `/clean`) — Force-wipe `/opt/clonebot/cache`\n"
-    "• `/clearresume` — Delete saved resume checkpoint\n"
-    "• `/workers <1-10>` — Set default parallel speed (`2x`–`4x` recommended)"
+    "📖 **BOTS BY SPW: Restricted Bot & Channel Cloner Guide**\n\n"
+    "**1. Connect Your User Account (Required for Restricted Content):**\n"
+    "• Send **`/qr`** and scan the QR code in **Telegram → Settings → Devices → Link Desktop Device**.\n\n"
+    "**2. How to Clone Restricted Media From Another Bot (`noforwards`):**\n"
+    "• Tap **🤖 Clone From a Bot Chat** on `/start` (or send **`/bots`**) to pick any bot you recently chatted with.\n"
+    "• Or paste the bot's username directly (`@example_bot` or `https://t.me/example_bot`).\n"
+    "• Choose **📥 Last 10 / 25 / 100 Msgs** or **🔄 Full History**, then tap **🔓 Unlock & Clone Media**!\n\n"
+    "**3. Guaranteed 1→2→3→4 Order & Album Preservation:**\n"
+    "• Streams messages in ascending order, extracts restricted/view-once media through `/opt/clonebot/cache`, and wipes the cache immediately."
 )
 
 @bot.on(events.NewMessage(pattern=r"^/start"))
@@ -920,7 +1409,8 @@ async def start_h(event):
         return
     cfg = load_config()
     dest = cfg.get("dest_chat") or "Not Set ❌ (Use /setdest)"
-    workers = cfg.get("parallel_workers", 2)
+    workers = cfg.get("parallel_workers", 3)
+    max_mb = cfg.get("max_file_size_mb", 150)
     cache_bytes = get_dir_size(CACHE_DIR)
     logged = await is_user_logged_in()
     if logged:
@@ -931,6 +1421,7 @@ async def start_h(event):
     res = load_resume()
 
     btns = [
+        [Button.inline("🤖 Clone From a Bot Chat (Restricted Save)", b"menu:bots")],
         [
             Button.inline("⚡ 1x", b"defw:1"),
             Button.inline("⚡ 2x", b"defw:2"),
@@ -946,15 +1437,54 @@ async def start_h(event):
         btns.insert(0, [Button.inline(f"▶️ Resume Saved Job (ID {res.get('start_id')} → {res.get('end_id')})", b"menu:resume")])
 
     await event.reply(
-        "🤖 **BOTS BY SPW — Parallel Album & Range Cloner**\n\n"
+        "🤖 **BOTS BY SPW: Perfect-Order & Restricted Bot Cloner**\n\n"
         f"📥 **Destination:** `{dest}`\n"
         f"👤 **User Session:** `{u_stat}`\n"
-        f"🖼️ **Album Grouping:** `Active ✅`\n"
-        f"🔢 **Custom ID Range:** `Supported ✅`\n"
-        f"⚡ **Parallel Workers:** `{workers}x Concurrent`\n"
+        f"🔓 **Restricted Bot/Channel Save:** `Auto-Unlock via User Cache ✅`\n"
+        f"🔢 **Order Engine:** `Strict 1→2→3→4 Stream + Album Lock ✅`\n"
+        f"📏 **Max File Size:** `Skip > {max_mb} MB` *(Change via `/maxsize`)*\n"
+        f"📡 **Bandwidth Meter:** `Live DL/UL Speed & Peak Tracker ✅`\n"
+        f"⚡ **Parallel Staging Workers:** `{workers}x Concurrent`\n"
         f"🧹 **Temp Cache Size:** `{fmt_size(cache_bytes)}`\n\n"
-        "👇 *Paste a channel/group link (or two post links for a range) below to start!*",
+        "👇 *Paste any channel post link, paste a `@bot_username`, or tap **🤖 Clone From a Bot Chat** below!*",
         buttons=btns
+    )
+
+@bot.on(events.NewMessage(pattern=r"^/bots"))
+async def list_bots_h(event):
+    if not is_admin(event.sender_id):
+        return
+    await show_recent_bots_menu(event)
+
+async def show_recent_bots_menu(event):
+    if not await is_user_logged_in():
+        return await event.respond("⚠️ **Please connect your User Session first using `/qr` so the bot can read your bot chats!**")
+
+    status = await event.respond("🔍 **Scanning your recent Telegram dialogs for Bot chats...**")
+    bot_Rows = []
+    try:
+        async for d in user_client.iter_dialogs(limit=150):
+            ent = d.entity
+            if isinstance(ent, User) and getattr(ent, "bot", False):
+                if ent.id == (await bot.get_me()).id:
+                    continue
+                uname = f"@{ent.username}" if getattr(ent, "username", None) else str(ent.id)
+                label = f"🤖 {ent.first_name or uname} ({uname})"
+                target_val = f"@{ent.username}" if getattr(ent, "username", None) else str(ent.id)
+                bot_Rows.append([Button.inline(label[:45], f"pickbot:{target_val}".encode())])
+                if len(bot_Rows) >= 12:
+                    break
+    except Exception as e:
+        return await status.edit(f"❌ **Error scanning bot dialogs:** `{e}`")
+
+    if not bot_Rows:
+        return await status.edit("ℹ️ **No recent bot chats found in your dialogs.** You can also paste any `@bot_username` directly in chat!")
+
+    bot_Rows.append([Button.inline("❌ Close", b"ctrl:close")])
+    await status.edit(
+        "🤖 **Select a Bot Chat to Unlock & Clone Restricted Media:**\n"
+        "*(Or send any `@bot_username` / `https://t.me/bot_username` directly in chat)*",
+        buttons=bot_Rows
     )
 
 @bot.on(events.NewMessage(pattern=r"^/help"))
@@ -962,6 +1492,16 @@ async def help_cmd_h(event):
     if not is_admin(event.sender_id):
         return
     await event.reply(HELP_INSTRUCTIONS)
+
+@bot.on(events.NewMessage(pattern=r"^/maxsize\s+(\d+(?:\.\d+)?)"))
+async def maxsize_cmd_h(event):
+    if not is_admin(event.sender_id):
+        return
+    val = max(1.0, float(event.pattern_match.group(1)))
+    cfg = load_config()
+    cfg["max_file_size_mb"] = val
+    save_config(cfg)
+    await event.reply(f"📏 **Max file size limit updated:** Files larger than `{val:.0f} MB` will be skipped automatically.")
 
 @bot.on(events.NewMessage(pattern=r"^/(?:cleancache|clean)"))
 async def cleancache_cmd_h(event):
@@ -1021,11 +1561,11 @@ async def setdest_h(event):
 async def delay_h(event):
     if not is_admin(event.sender_id):
         return
-    val = max(0.2, float(event.pattern_match.group(1)))
+    val = max(0.1, float(event.pattern_match.group(1)))
     cfg = load_config()
     cfg["delay_seconds"] = val
     save_config(cfg)
-    await event.reply(f"⏱️ **Worker delay updated to:** `{val}s`")
+    await event.reply(f"⏱️ **Publisher delay updated to:** `{val}s`")
 
 @bot.on(events.NewMessage(pattern=r"^/resume"))
 async def resume_h(event):
@@ -1106,7 +1646,7 @@ async def range_input_flow_h(event):
     setup_msg = st["setup_msg"]
     setup = PENDING_SETUP.get(key)
     if not setup:
-        return await event.reply("⚠️ **Session expired. Please paste the channel link again.**")
+        return await event.reply("⚠️ **Session expired. Please paste the link again.**")
 
     text = event.raw_text.strip()
     link_ids = [int(x) for x in re.findall(r"t\.me/(?:c/\d+|[a-zA-Z0-9_]+)/(\d+)", text)]
@@ -1115,12 +1655,12 @@ async def range_input_flow_h(event):
     else:
         nums = [int(x) for x in re.findall(r"\b\d+\b", text)]
         if not nums:
-            return await event.reply("⚠️ **Invalid range.** Send two numbers like `100 500` or `100-500`.")
+            return await event.reply("⚠️ **Invalid range.** Send two numbers like `1 500` or `100-500`.")
         if len(nums) >= 2:
             s_id, e_id = min(nums[0], nums[1]), max(nums[0], nums[1])
         else:
             s_id = nums[0]
-            e_id = setup.get("end_id", 0)
+            e_id = setup.get("last_id", 0)
 
     setup["start_id"] = max(1, s_id)
     setup["end_id"] = max(0, e_id)
@@ -1132,7 +1672,7 @@ async def range_input_flow_h(event):
 
     await setup_msg.edit(
         build_setup_text(setup),
-        buttons=build_setup_buttons(key, setup["workers"])
+        buttons=build_setup_buttons(key, setup["workers"], setup.get("is_bot_dm", False))
     )
 
 @bot.on(events.NewMessage(func=lambda e: e.sender_id in LOGIN_STATE and e.raw_text and not e.raw_text.startswith("/")))
@@ -1178,7 +1718,7 @@ async def clone_cmd_h(event):
         return
     await open_clone_setup(event, event.pattern_match.group(1))
 
-@bot.on(events.NewMessage(func=lambda e: is_admin(e.sender_id) and e.sender_id not in LOGIN_STATE and e.sender_id not in RANGE_WAIT_STATE and e.raw_text and ("t.me/" in e.raw_text or re.match(r"^-100\d+", e.raw_text.strip())) and not e.raw_text.startswith("/")))
+@bot.on(events.NewMessage(func=lambda e: is_admin(e.sender_id) and e.sender_id not in LOGIN_STATE and e.sender_id not in RANGE_WAIT_STATE and e.raw_text and ("t.me/" in e.raw_text or e.raw_text.strip().startswith("@") or re.match(r"^-?\d+$", e.raw_text.strip())) and not e.raw_text.startswith("/")))
 async def link_paste_h(event):
     await open_clone_setup(event, event.raw_text.strip())
 
@@ -1192,11 +1732,20 @@ async def open_clone_setup(event, raw_input: str):
         return await event.reply("⚠️ **First set your destination:** `/setdest <link or -100id>`")
 
     src_target, start_id, end_id = parse_input_with_range(raw_input)
-    default_w = int(cfg.get("parallel_workers", 2))
+    bounds = await inspect_source_bounds(src_target)
 
+    if bounds["is_private_or_bot"] and start_id == 1 and end_id == 0:
+        start_id = bounds["first_id"]
+        end_id = bounds["last_id"]
+
+    default_w = int(cfg.get("parallel_workers", 3))
     key = str(int(time.time() * 1000))
     setup = {
         "source": src_target,
+        "title": bounds["title"],
+        "is_bot_dm": bounds["is_private_or_bot"],
+        "first_id": bounds["first_id"],
+        "last_id": bounds["last_id"],
         "dest": dest,
         "start_id": start_id,
         "end_id": end_id,
@@ -1204,9 +1753,9 @@ async def open_clone_setup(event, raw_input: str):
     }
     PENDING_SETUP[key] = setup
 
-    await event.reply(
+    await event.respond(
         build_setup_text(setup),
-        buttons=build_setup_buttons(key, default_w)
+        buttons=build_setup_buttons(key, default_w, bounds["is_private_or_bot"])
     )
 
 @bot.on(events.CallbackQuery)
@@ -1220,6 +1769,16 @@ async def cb_h(event):
     if data == "ctrl:close":
         RANGE_WAIT_STATE.pop(uid, None)
         return await event.delete()
+
+    if data == "menu:bots":
+        await event.answer()
+        return await show_recent_bots_menu(event)
+
+    if data.startswith("pickbot:"):
+        target_bot = data.split(":", 1)[1]
+        await event.answer(f"Selected {target_bot}")
+        await event.delete()
+        return await open_clone_setup(event, target_bot)
 
     if data == "menu:help":
         await event.answer()
@@ -1261,7 +1820,40 @@ async def cb_h(event):
         cfg["parallel_workers"] = w
         save_config(cfg)
         await event.answer(f"⚡ Parallel speed set to {w}x")
-        return await event.edit(build_setup_text(setup), buttons=build_setup_buttons(key, w))
+        return await event.edit(
+            build_setup_text(setup),
+            buttons=build_setup_buttons(key, w, setup.get("is_bot_dm", False))
+        )
+
+    if data.startswith("setfull:"):
+        _, key = data.split(":")
+        setup = PENDING_SETUP.get(key)
+        if not setup:
+            return await event.answer("⚠️ Session expired, paste link again.", alert=True)
+        setup["start_id"] = setup.get("first_id", 1) if setup.get("is_bot_dm") else 1
+        setup["end_id"] = setup.get("last_id", 0) if setup.get("is_bot_dm") else 0
+        await event.answer("🔄 Set to Full History (Oldest → Latest)")
+        return await event.edit(
+            build_setup_text(setup),
+            buttons=build_setup_buttons(key, setup["workers"], setup.get("is_bot_dm", False))
+        )
+
+    if data.startswith("setlast:"):
+        _, key, count_str = data.split(":")
+        cnt = int(count_str)
+        setup = PENDING_SETUP.get(key)
+        if not setup:
+            return await event.answer("⚠️ Session expired, paste link again.", alert=True)
+        last_id = setup.get("last_id") or 0
+        first_id = setup.get("first_id") or 1
+        if last_id > 0:
+            setup["start_id"] = max(first_id, last_id - cnt + 1)
+            setup["end_id"] = last_id
+        await event.answer(f"📥 Set to Last {cnt} messages")
+        return await event.edit(
+            build_setup_text(setup),
+            buttons=build_setup_buttons(key, setup["workers"], setup.get("is_bot_dm", False))
+        )
 
     if data.startswith("setr:"):
         _, key = data.split(":")
@@ -1273,11 +1865,12 @@ async def cb_h(event):
         await event.answer("🔢 Send Start and End ID")
         return await event.edit(
             f"🔢 **Set Custom Message ID Range for `{setup['source']}`**\n\n"
-            f"Current Range: `{setup.get('start_id', 1)}` → `{setup.get('end_id') or 'End'}`\n\n"
+            f"Current Range: `{setup.get('start_id', 1)}` → `{setup.get('end_id') or 'Latest'}`\n"
+            f"Detected Bounds: `{setup.get('first_id', 1)}` → `{setup.get('last_id') or 'Auto'}`\n\n"
             "👇 **Send your desired range now in any format:**\n"
-            "• `100 - 500` or `100 500` *(Clones from ID 100 to 500)*\n"
+            "• `1 - 500` or `1 500` *(Clones from ID 1 to 500)*\n"
             "• `250` *(Starts at ID 250 and clones to the end)*\n"
-            "• Or paste two post links (`https://t.me/c/xxx/100 https://t.me/c/xxx/500`)",
+            "• Or paste two post links (`https://t.me/c/xxx/1 https://t.me/c/xxx/500`)",
             buttons=[[Button.inline("🔙 Back to Setup Menu", f"backr:{key}".encode())]]
         )
 
@@ -1287,7 +1880,10 @@ async def cb_h(event):
         setup = PENDING_SETUP.get(key)
         if not setup:
             return await event.answer("⚠️ Session expired.", alert=True)
-        return await event.edit(build_setup_text(setup), buttons=build_setup_buttons(key, setup["workers"]))
+        return await event.edit(
+            build_setup_text(setup),
+            buttons=build_setup_buttons(key, setup["workers"], setup.get("is_bot_dm", False))
+        )
 
     if data == "menu:qr":
         await event.answer()
@@ -1398,7 +1994,7 @@ echo "======================================================================"
 
 cat << 'SVC_EOF' > "$SERVICE_FILE"
 [Unit]
-Description=BOTS BY SPW Telegram Parallel Album & Range Cloner Bot
+Description=BOTS BY SPW Telegram Perfect-Order & Restricted Bot Cloner
 After=network-online.target
 Wants=network-online.target
 
@@ -1420,9 +2016,9 @@ systemctl restart clonebot
 
 echo ""
 echo "======================================================================"
-echo " ✅ BOTS BY SPW — INSTALLATION COMPLETE!"
+echo " ✅ BOTS BY SPW — PERFECT-ORDER & RESTRICTED BOT CLONER INSTALLED!"
 echo "======================================================================"
 echo " • Bot Status : $(systemctl is-active clonebot)"
 echo " • SSH Menu   : Type 'clone-bot' anytime in terminal"
-echo " • In-Bot Help: Send /start or /help to your bot on Telegram"
+echo " • In-Bot Help: Send /start or /bots to your bot on Telegram"
 echo "======================================================================"
