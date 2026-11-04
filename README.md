@@ -8,40 +8,36 @@
  |____/ \___/ |_| |____/  |____/   |_|   |____/|_|     \_/\_/   
 ```
 
-# ⚡ Telegram Parallel Temp-Cache, Album & Range Cloner Bot
+# ⚡ Telegram Perfect-Order Channel, Album & Restricted Bot Cloner
 
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-20.04%20%7C%2022.04%20%7C%2024.04-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/SPW-SL/Clone-Bot)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://github.com/SPW-SL/Clone-Bot)
-[![Telethon](https://img.shields.io/badge/MTProto-Telethon-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://github.com/SPW-SL/Clone-Bot)
-[![Systemd](https://img.shields.io/badge/Service-systemd-222222?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/SPW-SL/Clone-Bot)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-20.04%20%7C%2022.04%20%7C%2024.04-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://github.com/SPW-SL)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://github.com/SPW-SL)
+[![Telethon](https://img.shields.io/badge/MTProto-Telethon%20%2B%20Cryptg-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://github.com/SPW-SL)
+[![FFmpeg](https://img.shields.io/badge/Media-FFmpeg-007808?style=for-the-badge&logo=ffmpeg&logoColor=white)](https://github.com/SPW-SL)
 [![Maintained](https://img.shields.io/badge/Bots%20By-SPW--SL-00C853?style=for-the-badge)](https://github.com/SPW-SL)
 
-**A high-speed, zero-bloat Telegram Channel & Group Mass Cloner engineered for Ubuntu VPS.**  
-Clone **5,000+ messages**, preserve **multi-file Albums (`grouped_id`)**, select **custom message ID ranges**, and bypass **"Restrict saving content"** locks using an automated **Parallel Temp-Cache Pipeline** that leaves **`0.00 B`** behind on your server.
+**An high-speed, self-hosted Telegram cloner bot for Ubuntu VPS that creates an exact `1 → 2 → 3 → 4` sequential replica of any public/private channel, group, or save-restricted Telegram bot.**  
+Built on a 3-stage Producer-Consumer pipeline: parallel workers pre-upload media and multi-item albums to Telegram's cloud buffer while a single-threaded sequential publisher posts them in strict chronological order with zero VPS disk bloat (`0.00 B` left behind).
 
-[🚀 One-Line Install](#-one-line-vps-installation) • [✨ Key Features](#-key-features) • [📖 Interactive Usage Guide](#-interactive-usage-guide) • [⌨️ Bot Commands](#️-bot-commands) • [🖥️ SSH Manager](#️-terminal-ssh-manager-clone-bot)
+[🚀 One-Line Install](#-one-line-vps-installation) • [✨ Key Features](#-key-features) • [🧠 Pipeline Architecture](#-3-stage-perfect-order-architecture) • [📖 Usage Guide](#-interactive-usage-guide) • [⌨️ Bot Commands](#️-bot-commands)
 
 </div>
-
----
 
 ## ✨ Key Features
 
 | Feature | Description |
 | :--- | :--- |
-| 💾 **Zero-Bloat Temp-Cache Engine** | Bypasses `ChatForwardsRestrictedError` ("Restrict saving content") by caching media to `/opt/clonebot/cache`, extracting video metadata/thumbnails via `ffmpeg`, uploading to your destination, and **deleting the local cache file immediately**. |
-| ⚡ **Multi-Worker Parallelism (`1x`–`10x`)** | Choose how many files download and upload simultaneously (`1x` to `8x` via inline buttons, or up to `10x` via `/workers`). Each worker operates in an isolated cache directory. |
-| 🖼️ **Smart Album Preservation** | Automatically detects Telegram media groups (`grouped_id`) and peeks across batch boundaries so albums are never split in half—re-uploading them as combined albums. |
-| 🔢 **Custom Message ID Ranges** | Clone an entire channel or pick an exact `Start ID → End ID` slice via the interactive **`🔢 Set Custom ID Range`** button, two post links, or `/clone`. |
-| 📱 **Instant QR Code Login (`/qr`)** | Bypass datacenter/VPS SMS OTP blocks completely. Generate a live QR code inside Telegram chat and scan it via **Settings → Devices → Link Desktop Device**. |
-| 🔄 **Crash-Safe Auto-Resume** | Continuously tracks all in-flight parallel workers and saves the lowest unfinished message ID to `resume.json` so you can pause, cancel, or `/resume` without skipping a single file. |
-| 🧹 **Instant Cache Wiper (`/cleancache`)** | Automatic `finally:` block cleanup after every file, plus a manual `/cleancache` command and button showing live cache disk usage. |
-
----
+| 🔢 **Guaranteed `1 → 2 → 3 → 4` Order** | Uses `iter_messages(reverse=True)` to stream source posts in ascending order (skipping deleted ID gaps like `4–8` automatically) and maps them into a clean `1, 2, 3, 4` sequence at the destination. |
+| 🔓 **Restricted Bot & Channel Unlocker (`/bots`)** | Extracts save-restricted (`noforwards=True`) and view-once (`ttl_seconds`) media from other Telegram bots and private channels via your logged-in User Session cache. |
+| 🖼️ **100% Album & Grid Preservation** | Detects consecutive messages sharing a `grouped_id` (up to 10 items), stages them concurrently, and publishes them as a single combined album with original captions and formatting intact. |
+| ☁️ **Parallel Cloud Pre-Uploading (`1x`–`8x`)** | Multiple background workers download files, extract FFmpeg video duration/thumbnails, and pre-upload raw `InputFile` handles to Telegram's cloud buffer before their turn in the publish queue. |
+| 📡 **Live Download & Upload Bandwidth Meter** | Real-time dashboard displays active Download (`⬇️ MB/s`), Upload (`⬆️ MB/s`), Peak speeds, and Total Data Transferred (`GB`) across all concurrent workers. |
+| 📏 **Pre-Download File Size Filter (`150 MB`)** | Inspects Telegram file metadata before downloading and automatically skips files larger than `150 MB` (adjustable anytime via `/maxsize <MB>`). |
+| 🧹 **Zero-Storage Auto-Cleanup** | Each message or album is processed inside `/opt/clonebot/cache/unit_<id>/` and deleted immediately inside a `finally:` block the moment it is published. |
 
 ## 🚀 One-Line VPS Installation
 
-Run the following command as `root` on any **Ubuntu 20.04 / 22.04 / 24.04** VPS:
+Run on any **Ubuntu 20.04 / 22.04 / 24.04** server as `root`:
 
 ```bash
 curl -sSL [https://raw.githubusercontent.com/SPW-SL/Clone-Bot/main/install.sh](https://raw.githubusercontent.com/SPW-SL/Clone-Bot/main/install.sh) -o install.sh && sudo bash install.sh
@@ -59,131 +55,88 @@ sudo ./install.sh
 
 </details>
 
-<details>
-<summary><b>🔑 What credentials do I need during setup?</b></summary>
-
-During installation, the script will interactively prompt you for:
-1. **`API_ID` & `API_HASH`**: Get these from [my.telegram.org](https://my.telegram.org) under **API development tools**.
-2. **`BOT_TOKEN`**: Create a new bot via [@BotFather](https://t.me/BotFather) and copy the HTTP API token.
-3. **`ADMIN_IDS`**: Your numeric Telegram User ID(s) separated by spaces (get yours from [@userinfobot](https://t.me/userinfobot)).
-
-> 🔒 *Your credentials are saved locally in `/opt/clonebot/config.json` with `chmod 600` root-only permissions.*
-
-</details>
-
----
-
-## 🧠 How the Parallel Temp-Cache Pipeline Works
-
-<details open>
-<summary><b>🔍 Click to expand/collapse architecture workflow</b></summary>
+## 🧠 3-Stage Perfect-Order Architecture
 
 ```text
-[Source Group / Restricted Channel]
+[Source Channel / Private Group / Restricted Bot Chat]
          │
-         ├──► Scanner fetches batch & groups Albums (grouped_id) + Boundary Peek
+         ├──► STAGE 1: Chronological Streamer & Filter
+         │      • Streams existing messages in ascending order (1 → 2 → 3 → 9...)
+         │      • Skips deleted gaps instantly & filters out files > 150 MB
+         │      • Bundles consecutive grouped_id items into Album Units
          │
-         ▼
-   [Asyncio Semaphore Pool (1x - 10x Parallel Workers)]
+         ├──► STAGE 2: Parallel Producer Pool (1x to 8x Concurrent Workers)
+         │      • Downloads media to /opt/clonebot/cache/unit_<id>/
+         │      • Extracts FFmpeg video duration, dimensions & thumbnail
+         │      • Pre-uploads InputFile handles to Telegram's cloud buffer
+         │      • Places ready payload into numbered Slot[0], Slot[1], Slot[2]...
          │
-         ├──► Worker 1: Caches to /opt/clonebot/cache/unit_101/ ──► FFmpeg Meta/Thumb ──► Uploads to Destination ──► Wipes unit_101/ (0.00 B)
-         ├──► Worker 2: Caches to /opt/clonebot/cache/unit_102/ ──► FFmpeg Meta/Thumb ──► Uploads Combined Album ──► Wipes unit_102/ (0.00 B)
-         └──► Worker N: Caches to /opt/clonebot/cache/unit_103/ ──► FFmpeg Meta/Thumb ──► Uploads to Destination ──► Wipes unit_103/ (0.00 B)
+         └──► STAGE 3: Single-Threaded Sequential Publisher (Consumer)
+                • Waits strictly for Slot[0] ──► Publishes Post #1 ──► Wipes Cache
+                • Waits strictly for Slot[1] ──► Publishes Post #2 ──► Wipes Cache
+                • Guarantees 100% linear 1, 2, 3, 4 order at the destination
 ```
-
-### Transfer Modes Comparison
-
-| Mode | Speed | Bypasses "Restrict Saving Content"? | Preserves Albums? | VPS Disk Used |
-| :--- | :--- | :---: | :---: | :---: |
-| **💾 Cache & Upload Media + Albums** | Fast (`1x`–`10x` Parallel) | ✅ **Yes (100%)** | ✅ **Yes** | `0.00 B` Permanent (Auto-wiped per file) |
-| **💾 Cache & Upload All (Media + Text)** | Fast (`1x`–`10x` Parallel) | ✅ **Yes (100%)** | ✅ **Yes** | `0.00 B` Permanent (Auto-wiped per file) |
-| **📨 Direct Forward / 📋 Direct Copy** | Instant (Server-Side) | ⚠️ Auto-falls back to Cache mode if restricted | ✅ **Yes** | `0.00 B` |
-
-</details>
-
----
 
 ## 📖 Interactive Usage Guide
 
 <details open>
-<summary><b>1️⃣ Step 1: Connect a Telegram User Session (QR Code or Phone)</b></summary>
+<summary><b>1. Initial Setup (One-Time)</b></summary>
 
-To clone private groups, restricted channels, or external public channels, link a Telegram account that is a member of the source chat:
-1. Open your bot on Telegram and send **`/qr`** *(Recommended — no SMS/OTP needed)*.
-2. On your phone, open **Telegram → Settings → Devices → Link Desktop Device** and scan the QR image sent by the bot.
-3. Alternatively, use **`/login`** to sign in using your international phone number (`+1234567890`) and in-app OTP code.
-
-</details>
-
-<details>
-<summary><b>2️⃣ Step 2: Set Your Destination Channel or Group</b></summary>
-
-1. Add your Cloner Bot as an **Administrator** (with *Post Messages* permission) in your destination Channel or Group.
-2. Set the destination using any of these formats:
+1. Open your bot on Telegram and send **`/start`**.
+2. Connect your Telegram User Session (required for private channels and restricted bots) by sending **`/qr`** and scanning the QR code in **Telegram → Settings → Devices → Link Desktop Device**.
+3. Make your bot an **Admin** in your destination channel or group, then set the destination:
    ```text
    /setdest [https://t.me/your_destination_channel](https://t.me/your_destination_channel)
    ```
+   *(Or for a private destination channel/group: `/setdest -1001234567890`)*
+
+</details>
+
+<details open>
+<summary><b>2. Cloning a Public or Private Channel/Group in Exact Order</b></summary>
+
+1. Paste any post link from the source channel/group (e.g., `https://t.me/c/2152391268/1`), or paste two links to define a custom range:
    ```text
-   /setdest -1001234567890
+   [https://t.me/c/2152391268/1](https://t.me/c/2152391268/1) [https://t.me/c/2152391268/500](https://t.me/c/2152391268/500)
    ```
-   *(Or simply type `/setdest` directly inside your destination group).*
+2. Select your desired parallel worker speed (`1x` to `8x`) and tap **`🔄 Full History (Oldest→End)`** or **`🔢 Custom ID Range`**.
+3. Tap **`🔓 Unlock & Clone Media + Albums`** to start cloning.
 
 </details>
 
-<details>
-<summary><b>3️⃣ Step 3: Select Your Message Range & Parallel Speed</b></summary>
+<details open>
+<summary><b>3. Unlocking Save-Restricted Media From Another Bot (`/bots`)</b></summary>
 
-You can trigger a clone job and select custom ranges in **three ways**:
-
-* **Method A — Interactive Setup Menu:**  
-  Paste any channel/group link (or the link to the last message, e.g., `https://t.me/c/123456789/5000`).  
-  Tap **`🔢 Set Custom ID Range (Start - End)`** and reply with `100 - 500` (or `250` to start at ID 250 and clone to the end).
-* **Method B — Paste Two Message Links at Once:**  
-  Copy the link of the **first post** and the **last post** you want to clone, and send both in a single message:
-  ```text
-  [https://t.me/c/123456789/100](https://t.me/c/123456789/100) [https://t.me/c/123456789/500](https://t.me/c/123456789/500)
-  ```
-* **Method C — Direct Command:**  
-  ```text
-  /clone [https://t.me/c/123456789/5000](https://t.me/c/123456789/5000) 100 500
-  ```
-
-Next, tap your desired **Parallel Worker Count (`1x`–`8x`)** and select **`💾 Cache & Upload Media + Albums`**!
+1. Send **`/bots`** (or tap **`🤖 Clone From a Bot Chat (Restricted Save)`** on the `/start` menu).
+2. The bot scans your recent dialogs and displays clickable buttons for every bot you have interacted with (or simply paste `@target_bot_username` in chat).
+3. Tap **`📥 Last 10 Msgs`**, **`📥 Last 25 Msgs`**, **`📥 Last 100 Msgs`**, or **`🔄 Full History`**.
+4. Tap **`🔓 Unlock & Clone Media + Albums`**. Your User Session downloads the protected media into temporary cache and re-uploads it permanently to your destination channel.
 
 </details>
-
----
 
 ## ⌨️ Bot Commands
 
 | Command | Description |
 | :--- | :--- |
-| `/start` | Open the main dashboard, view live cache size, user session status, and quick-action buttons. |
-| `/help` | Display the in-bot step-by-step usage and troubleshooting guide. |
-| `/qr` | Generate a scannable Telegram QR code to log in any user account without needing an SMS/app OTP. |
-| `/login` | Log in a user session using an international phone number and OTP code. |
-| `/logout` | Log out the active user session and wipe `user_session.session` clean. |
-| `/setdest <link/id>` | Set the target destination Channel or Group (e.g., `/setdest https://t.me/my_channel`). |
-| `/clone <link> [start] [end]` | Start a clone setup with an optional custom message ID range. |
-| `/workers <1-10>` | Set the default number of parallel download/upload workers (`2` to `4` recommended). |
-| `/delay <seconds>` | Set the anti-flood delay between worker batches (default: `1.5` seconds). |
-| `/resume` | Resume an interrupted or cancelled clone job from the exact last saved message ID. |
-| `/clearresume` | Delete the saved `resume.json` checkpoint. |
-| `/cleancache` or `/clean` | Force-delete all temporary files inside `/opt/clonebot/cache` and show freed space. |
-
----
+| `/start` | Open the main dashboard, view active settings, or resume a saved job. |
+| `/bots` | Scan your recent Telegram dialogs and pick a Bot chat to unlock & clone restricted media. |
+| `/setdest <link/id>` | Set the destination channel or group where cloned content will be published. |
+| `/clone <link> [start] [end]` | Open the setup menu for a channel, group, or `@bot_username` with an optional ID range. |
+| `/maxsize <MB>` | Set the maximum file size limit in MB (default: `150` — skips larger files automatically). |
+| `/workers <1-10>` | Set the default number of concurrent pre-upload workers (`3x` recommended). |
+| `/delay <seconds>` | Set the delay between sequential publishes (default: `0.4s`). |
+| `/qr` | Log in to your Telegram User Session via QR code (no SMS OTP required). |
+| `/login` / `/logout` | Log in via phone number OTP or log out of the active User Session. |
+| `/resume` | Resume an interrupted clone job from the exact last published message ID. |
+| `/clearresume` | Delete the saved resume checkpoint. |
+| `/cleancache` or `/clean` | Force-wipe `/opt/clonebot/cache` and verify `0.00 B` disk usage. |
 
 ## 🖥️ Terminal SSH Manager (`clone-bot`)
 
-After installation, type **`clone-bot`** from anywhere in your VPS SSH terminal to open the interactive management menu:
+Type **`clone-bot`** anywhere in your Ubuntu VPS terminal to open the interactive service manager:
 
 ```text
 ======================================================================
-  ____   ___ _____ ____    ____  __   __  ____  ______        __
- | __ ) / _ \_   _/ ___|  | __ ) \ \ / / / ___||  _ \ \      / /
- |  _ \| | | || | \___ \  |  _ \  \ V /  \___ \| |_) \ \ /\ / / 
- | |_) | |_| || |  ___) | | |_) |  | |    ___) |  __/ \ V  V /  
- |____/ \___/ |_| |____/  |____/   |_|   |____/|_|     \_/\_/   
                  CLONER BOT - SSH MANAGEMENT MENU
 ======================================================================
 1) Check Service Status
@@ -196,16 +149,6 @@ After installation, type **`clone-bot`** from anywhere in your VPS SSH terminal 
 0) Exit
 ======================================================================
 ```
-
----
-
-## 💡 Recommended Best Practices
-
-* **Optimal Parallel Workers (`2x`–`4x`):** While the bot supports up to `10x` concurrent workers, `2x` to `4x` provides fast throughput while minimizing Telegram `FloodWaitError` pauses.
-* **Separate Bot Tokens:** If you run multiple bots on the same VPS (such as a Leech Bot and Cloner Bot), generate a separate `@BotFather` token for each bot so their sessions never conflict.
-* **Disclaimer:** Use this tool responsibly for personal backups and channels/groups where you have permission. Excessive automated scraping may trigger Telegram rate limits on the connected user account.
-
----
 
 <div align="center">
   <b>Developed & Maintained by <a href="https://github.com/SPW-SL">BOTS BY SPW (SPW-SL)</a></b>
